@@ -1,6 +1,6 @@
 import streamlit as st
-from streamlit_leaflet import LeafletMap
-from datetime import datetime
+from streamlit_folium import st_folium
+import folium
 
 # 初始化会话状态（保存无人机状态）
 if "drone_data" not in st.session_state:
@@ -23,14 +23,13 @@ col_map, col_log = st.columns([2, 1])
 with col_map:
     st.subheader("无人机位置地图")
     map_center = [st.session_state.drone_data["lat"], st.session_state.drone_data["lon"]]
-    m = LeafletMap(center=map_center, zoom=18)
-    # 标记无人机当前位置
-    m.add_marker(
-        location=map_center,
-        popup=f"序号: {st.session_state.drone_data['sequence']}\n状态: {st.session_state.drone_data['status']}",
-        icon="green" if st.session_state.drone_data["status"] == "正常" else "red"
-    )
-    m.to_streamlit(height=500)
+m = folium.Map(location=map_center, zoom_start=18)
+folium.Marker(
+    location=map_center,
+    popup=f"序号: {st.session_state.drone_data['sequence']}\n状态: {st.session_state.drone_data['status']}",
+    icon=folium.Icon(color="green" if st.session_state.drone_data["status"] == "正常" else "red")
+).add_to(m)
+st_folium(m, height=500)
 
 # ---------------------- 右侧：心跳控制 ----------------------
 with col_log:
