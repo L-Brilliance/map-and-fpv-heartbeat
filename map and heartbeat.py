@@ -29,7 +29,8 @@ folium.Marker(
     popup=f"序号: {st.session_state.drone_data['sequence']}\n状态: {st.session_state.drone_data['status']}",
     icon=folium.Icon(color="green" if st.session_state.drone_data["status"] == "正常" else "red")
 ).add_to(m)
-st_folium(m, height=500)
+from streamlit.components.v1 import html
+html(m._repr_html_(), height=500)
 
 # ---------------------- 右侧：心跳控制 ----------------------
 with col_log:
