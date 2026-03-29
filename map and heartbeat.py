@@ -120,8 +120,13 @@ with col_chart:
         # 折线图：心跳序号随时间变化
         st.line_chart(df, x="time", y="seq", color="#00aaff", height=250)
         # 柱状图：状态统计
-        status_count = df["status"].value_counts()
-        st.bar_chart(status_count, color={"正常": "#22c55e", "超时": "#ef4444"})
+        # 转为 DataFrame 并指定颜色
+status_df = df["status"].value_counts().reset_index()
+status_df.columns = ["状态", "数量"]
+color_map = {"正常": "#22c55e", "超时": "#ef4444"}
+status_df["color"] = status_df["状态"].map(color_map)
+
+st.bar_chart(status_df, x="状态", y="数量", color="color")
     else:
         st.info("暂无心跳数据，点击「发送心跳包」生成数据")
 
