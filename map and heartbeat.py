@@ -127,7 +127,7 @@ color_map = {"正常": "#22c55e", "超时": "#ef4444"}
 status_df["color"] = status_df["状态"].map(color_map)
 
 st.bar_chart(status_df, x="状态", y="数量", color="color")
-    else:
+     else:
         st.info("暂无心跳数据，点击「发送心跳包」生成数据")
 
 # 自动发送心跳逻辑
