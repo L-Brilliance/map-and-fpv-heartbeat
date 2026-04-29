@@ -1,12 +1,11 @@
 import streamlit as st
+from streamlit_folium import st_folium
 import folium
 from folium.plugins import Draw
 from datetime import datetime, timedelta
 import pandas as pd
-from streamlit.components.v1 import html
 import time
 import math
-import json
 
 # -------------------------- 坐标系转换工具（WGS84 ↔ GCJ-02） --------------------------
 x_pi = 3.14159265358979324 * 3000.0 / 180.0
@@ -50,22 +49,24 @@ def _transformlng(lng, lat):
     ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 * math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
     return ret
 
-# -------------------------- 初始化会话状态（坐标锁定不偏移） --------------------------
+# -------------------------- 初始化会话状态（坐标改到校内） --------------------------
 if "drone_data" not in st.session_state:
     st.session_state.drone_data = {
-        "lat_a": 32.2322,
-        "lon_a": 118.7490,
-        "lat_b": 32.2343,
-        "lon_b": 118.7490,
-        "current_lat": 32.2322,
-        "current_lon": 118.7490,
+        # ✅ 起点/终点坐标已改到你红色框内的校内位置
+        "lat_a": 32.2330,
+        "lon_a": 118.7480,
+        "lat_b": 32.2335,
+        "lon_b": 118.7485,
+        "current_lat": 32.2330,
+        "current_lon": 118.7480,
         "sequence": 0,
         "status": "正常",
         "heartbeats": [],
         "last_receive_time": datetime.now(),
         "obstacles": [],
         "map_tile": "satellite",
-        "avoid_path": None
+        "avoid_path": None,
+        "last_click": None  # 存储地图点击的终点坐标
     }
 
 # -------------------------- 简易碰撞检测（无需 shapely） --------------------------
@@ -109,25 +110,36 @@ def generate_avoid_path(start, end, obs, offset_m=8):
 
 # -------------------------- 页面配置 --------------------------
 st.set_page_config(page_title="无人机避障系统", layout="wide")
-st.title("无人机智能化避障飞行系统（坐标已修复不偏移）")
+st.title("无人机智能化避障飞行系统（坐标已修正 + 地图选终点）")
 col_left, col_right = st.columns([1, 2])
 
 # -------------------------- 左侧面板 --------------------------
 with col_left:
-    st.subheader("📍 起点 & 终点（固定不偏移）")
+    st.subheader("📍 起点设置（固定在校内）")
     lat_a = st.number_input("起点纬度", value=st.session_state.drone_data["lat_a"], format="%.6f")
     lon_a = st.number_input("起点经度", value=st.session_state.drone_data["lon_a"], format="%.6f")
-    lat_b = st.number_input("终点纬度", value=st.session_state.drone_data["lat_b"], format="%.6f")
-    lon_b = st.number_input("终点经度", value=st.session_state.drone_data["lon_b"], format="%.6f")
 
-    if st.button("✅ 更新坐标（不偏移）"):
+    if st.button("✅ 更新起点（不偏移）"):
         st.session_state.drone_data["lat_a"] = lat_a
         st.session_state.drone_data["lon_a"] = lon_a
-        st.session_state.drone_data["lat_b"] = lat_b
-        st.session_state.drone_data["lon_b"] = lon_b
         st.session_state.drone_data["current_lat"] = lat_a
         st.session_state.drone_data["current_lon"] = lon_a
-        st.success("坐标已锁定，无偏移")
+        st.success("起点已锁定在校内！")
+
+    st.subheader("🎯 终点设置（可地图点击选择）")
+    if st.session_state.drone_data["last_click"]:
+        click_lat, click_lon = st.session_state.drone_data["last_click"]
+        lat_b = st.number_input("终点纬度", value=click_lat, format="%.6f")
+        lon_b = st.number_input("终点经度", value=click_lon, format="%.6f")
+        st.info("✅ 已自动填入地图点击的坐标！")
+    else:
+        lat_b = st.number_input("终点纬度", value=st.session_state.drone_data["lat_b"], format="%.6f")
+        lon_b = st.number_input("终点经度", value=st.session_state.drone_data["lon_b"], format="%.6f")
+
+    if st.button("✅ 确认终点"):
+        st.session_state.drone_data["lat_b"] = lat_b
+        st.session_state.drone_data["lon_b"] = lon_b
+        st.success("终点已更新！")
 
     st.subheader("🗺️ 地图")
     tile = st.radio("地图类型", ["卫星", "普通"])
@@ -179,18 +191,18 @@ with col_left:
             st.session_state.drone_data["avoid_path"] = None
             st.success("✅ 路径通畅，无需绕飞")
 
-# -------------------------- 右侧地图（修复了PolyLine格式错误） --------------------------
+# -------------------------- 右侧地图（支持点击选终点） --------------------------
 with col_right:
-    st.subheader("🗺️ 飞行地图（坐标100%精准）")
+    st.subheader("🗺️ 飞行地图（点击地图可选择终点）")
     center_lat = (lat_a + lat_b) / 2
     center_lon = (lon_a + lon_b) / 2
     gcj_center = wgs84_to_gcj02(center_lon, center_lat)
 
     if st.session_state.drone_data["map_tile"] == "satellite":
-        m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=19,
+        m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=18,
                       tiles="https://webst01.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}", attr="高德卫星")
     else:
-        m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=19,
+        m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=18,
                       tiles="https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=8", attr="高德地图")
 
     # 起点标记
@@ -209,7 +221,7 @@ with col_right:
         icon=folium.Icon(color="blue")
     ).add_to(m)
 
-    # ✅ 修复：PolyLine 坐标格式错误
+    # 航线
     folium.PolyLine(
         locations=[
             [gcj_a[1], gcj_a[0]],
@@ -246,7 +258,17 @@ with col_right:
                 edit_options={"edit": True, "remove": True})
     draw.add_to(m)
 
-    html(m._repr_html_(), height=600)
+    # ✅ 支持地图点击的核心组件
+    map_data = st_folium(m, height=600, width=800)
+
+    # 处理地图点击事件
+    if map_data and "last_clicked" in map_data and map_data["last_clicked"]:
+        click_lat = map_data["last_clicked"]["lat"]
+        click_lon = map_data["last_clicked"]["lng"]
+        # GCJ-02转WGS84存起来
+        wgs_lon, wgs_lat = gcj02_to_wgs84(click_lon, click_lat)
+        st.session_state.drone_data["last_click"] = (wgs_lat, wgs_lon)
+        st.success(f"✅ 已在地图上点击选点：纬度{wgs_lat:.6f}, 经度{wgs_lon:.6f}，请点击「确认终点」按钮！")
 
 # -------------------------- 心跳监测 --------------------------
 st.divider()
