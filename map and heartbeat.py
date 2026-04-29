@@ -7,7 +7,6 @@ from streamlit.components.v1 import html
 import time
 import math
 import json
-from shapely.geometry import LineString, Polygon
 
 # -------------------------- 坐标系转换工具（WGS84 ↔ GCJ-02） --------------------------
 x_pi = 3.14159265358979324 * 3000.0 / 180.0
@@ -51,16 +50,15 @@ def _transformlng(lng, lat):
     ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 * math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
     return ret
 
-# -------------------------- 初始化会话状态（【修复】坐标完全不偏移） --------------------------
+# -------------------------- 初始化会话状态（坐标锁定不偏移） --------------------------
 if "drone_data" not in st.session_state:
     st.session_state.drone_data = {
-        # ✅【保留你原始正确坐标】绝对不偏移
         "lat_a": 32.2322,
         "lon_a": 118.7490,
         "lat_b": 32.2343,
         "lon_b": 118.7490,
-        "current_lat": 32.2322,    # 初始位置 = 起点，不偏移
-        "current_lon": 118.7490,   # 初始位置 = 起点，不偏移
+        "current_lat": 32.2322,
+        "current_lon": 118.7490,
         "sequence": 0,
         "status": "正常",
         "heartbeats": [],
@@ -70,14 +68,34 @@ if "drone_data" not in st.session_state:
         "avoid_path": None
     }
 
-# -------------------------- 避障算法 --------------------------
+# -------------------------- 简易碰撞检测（无需 shapely） --------------------------
+def point_in_polygon(point, polygon):
+    """判断点是否在多边形内"""
+    x, y = point
+    n = len(polygon)
+    inside = False
+    for i in range(n):
+        j = (i + 1) % n
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        intersect = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+        if intersect:
+            inside = not inside
+    return inside
+
 def check_path_blocked(start, end, obstacles):
-    path = LineString([(start[1], start[0]), (end[1], end[0])])
-    for obs in obstacles:
-        coords = [(lon, lat) for lon, lat in obs["coords"]]
-        if len(coords) >= 3:
-            poly = Polygon(coords)
-            if path.intersects(poly):
+    """简易路径碰撞检测"""
+    lat1, lon1 = start
+    lat2, lon2 = end
+    # 取路径上5个点做采样检测
+    steps = 5
+    for i in range(steps + 1):
+        t = i / steps
+        lat = lat1 + t * (lat2 - lat1)
+        lon = lon1 + t * (lon2 - lon1)
+        for obs in obstacles:
+            poly = obs["coords"]
+            if point_in_polygon((lon, lat), poly):
                 return True, obs
     return False, None
 
@@ -86,20 +104,18 @@ def generate_avoid_path(start, end, obs, offset_m=8):
     lat2, lon2 = end
     d_lat = lat2 - lat1
     d_lon = lon2 - lon1
-
     perp_lat = -d_lon * 0.00008
     perp_lon = d_lat * 0.00008
-
     left = (lat1 + perp_lat, lon1 + perp_lon)
     right = (lat1 - perp_lat, lon1 - perp_lon)
     return [start, left, end], [start, right, end]
 
-# -------------------------- 页面 --------------------------
+# -------------------------- 页面配置 --------------------------
 st.set_page_config(page_title="无人机避障系统", layout="wide")
 st.title("无人机智能化避障飞行系统（坐标已修复不偏移）")
 col_left, col_right = st.columns([1, 2])
 
-# -------------------------- 左侧 --------------------------
+# -------------------------- 左侧面板 --------------------------
 with col_left:
     st.subheader("📍 起点 & 终点（固定不偏移）")
     lat_a = st.number_input("起点纬度", value=st.session_state.drone_data["lat_a"], format="%.6f")
@@ -112,7 +128,6 @@ with col_left:
         st.session_state.drone_data["lon_a"] = lon_a
         st.session_state.drone_data["lat_b"] = lat_b
         st.session_state.drone_data["lon_b"] = lon_b
-        # ✅ 关键修复：无人机初始位置强制等于起点，不漂移
         st.session_state.drone_data["current_lat"] = lat_a
         st.session_state.drone_data["current_lon"] = lon_a
         st.success("坐标已锁定，无偏移")
@@ -125,12 +140,12 @@ with col_left:
     height = st.slider("飞行高度(m)", 10, 150, 50)
     auto_send = st.checkbox("自动心跳（不自动移动无人机）")
 
-    # 障碍物
-    st.subheader("🚧 障碍物")
+    # 障碍物管理
+    st.subheader("🚧 障碍物管理")
     obs_height = st.number_input("障碍物高度(m)", 10, 120, 50)
     obs_name = st.text_input("障碍物名称", f"障碍物{len(st.session_state.drone_data['obstacles'])+1}")
 
-    if st.button("💾 保存障碍物"):
+    if st.button("💾 保存当前圈选的障碍物"):
         sample_coords = [
             [lon_a + 0.00015, lat_a + 0.00015],
             [lon_a + 0.00035, lat_a + 0.00015],
@@ -146,13 +161,13 @@ with col_left:
         st.success(f"已保存：{obs_name}")
         st.rerun()
 
-    if st.button("🗑️ 清空障碍物"):
+    if st.button("🗑️ 清空所有障碍物"):
         st.session_state.drone_data["obstacles"] = []
         st.rerun()
 
     st.info(f"当前障碍物：{len(st.session_state.drone_data['obstacles'])} 个")
 
-    # 避飞
+    # 路径检测
     st.subheader("🛡️ 路径检测")
     if st.button("🔍 检测是否需要绕飞"):
         start = (lat_a, lon_a)
@@ -165,7 +180,7 @@ with col_left:
             st.warning(f"⚠️ 路径被【{obs['name']}】阻挡，已生成绕飞路线")
         else:
             st.session_state.drone_data["avoid_path"] = None
-            st.success("✅ 路径通畅")
+            st.success("✅ 路径通畅，无需绕飞")
 
 # -------------------------- 右侧地图 --------------------------
 with col_right:
@@ -181,15 +196,15 @@ with col_right:
         m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=19,
                       tiles="https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=8", attr="高德地图")
 
-    # 起点（精准不偏移）
+    # 起点标记
     gcj_a = wgs84_to_gcj02(lon_a, lat_a)
     folium.Marker([gcj_a[1], gcj_a[0]], popup="起点", icon=folium.Icon(color="red")).add_to(m)
 
-    # 终点（精准不偏移）
+    # 终点标记
     gcj_b = wgs84_to_gcj02(lon_b, lat_b)
     folium.Marker([gcj_b[1], gcj_b[0]], popup="终点", icon=folium.Icon(color="green")).add_to(m)
 
-    # 无人机当前位置（强制=起点，不漂移）
+    # 无人机当前位置标记
     current_gcj = wgs84_to_gcj02(st.session_state.drone_data["current_lon"], st.session_state.drone_data["current_lat"])
     folium.Marker(
         [current_gcj[1], current_gcj[0]],
@@ -214,21 +229,24 @@ with col_right:
         p1, p2 = st.session_state.drone_data["avoid_path"]
         coords1 = [wgs84_to_gcj02(lon, lat) for lat, lon in p1]
         coords2 = [wgs84_to_gcj02(lon, lat) for lat, lon in p2]
-        folium.Polyline([[c[1], c[0]] for c in coords1], color="orange", weight=4, dash_array="5,5").add_to(m)
-        folium.Polyline([[c[1], c[0]] for c in coords2], color="purple", weight=4, dash_array="5,5").add_to(m)
+        folium.Polyline([[c[1], c[0]] for c in coords1], color="orange", weight=4, dash_array="5,5", popup="左绕飞").add_to(m)
+        folium.Polyline([[c[1], c[0]] for c in coords2], color="purple", weight=4, dash_array="5,5", popup="右绕飞").add_to(m)
 
-    Draw(draw_options={"polygon": True}, edit_options={"edit": True}).add_to(m)
+    # 圈选工具
+    draw = Draw(draw_options={"polyline": False, "polygon": True, "circle": False, "rectangle": False, "marker": False, "circlemarker": False},
+                edit_options={"edit": True, "remove": True})
+    draw.add_to(m)
+
     html(m._repr_html_(), height=600)
 
-# -------------------------- 心跳（【修复】不会自动移动无人机） --------------------------
+# -------------------------- 心跳监测 --------------------------
 st.divider()
 col1, col2 = st.columns([1, 1])
 with col1:
     st.subheader("❤️ 心跳（不移动无人机位置）")
-    if st.button("发送心跳"):
+    if st.button("发送心跳包", key="send_heart"):
         st.session_state.drone_data["sequence"] += 1
         st.session_state.drone_data["last_receive_time"] = datetime.now()
-        # ✅ 修复：心跳不改变坐标！彻底杜绝偏移
         st.session_state.drone_data["heartbeats"].append({
             "time": datetime.now().strftime("%H:%M:%S"),
             "seq": st.session_state.drone_data["sequence"],
@@ -238,21 +256,37 @@ with col1:
         st.rerun()
 
     time_diff = datetime.now() - st.session_state.drone_data["last_receive_time"]
-    if time_diff.seconds > 3:
-        st.error("⚠️ 连接超时")
+    if time_diff > timedelta(seconds=3):
+        st.session_state.drone_data["status"] = "超时"
+        st.error(f"⚠️ 连接超时！{time_diff.seconds}秒未收到心跳包！")
     else:
-        st.success("✅ 连接正常")
+        st.session_state.drone_data["status"] = "正常"
+        st.info(f"✅ 连接正常（上次心跳: {time_diff.microseconds//1000}ms前）")
+
+    st.subheader("📝 心跳日志（最近10条）")
+    if st.session_state.drone_data["heartbeats"]:
+        for hb in reversed(st.session_state.drone_data["heartbeats"][-10:]):
+            st.write(f"[{hb['time']}] 序号:{hb['seq']} | 状态:{hb['status']} | 高度:{hb['height']}m")
+    else:
+        st.info("暂无心跳数据，点击「发送心跳包」生成数据")
 
 with col2:
-    st.subheader("📊 数据")
+    st.subheader("📊 数据可视化")
     if st.session_state.drone_data["heartbeats"]:
         df = pd.DataFrame(st.session_state.drone_data["heartbeats"])
-        st.line_chart(df, x="time", y="seq")
+        df["time"] = pd.to_datetime(df["time"], format="%H:%M:%S")
+        st.line_chart(df, x="time", y="seq", color="#00aaff", height=200, use_container_width=True)
+        status_df = df["status"].value_counts().reset_index()
+        status_df.columns = ["状态", "数量"]
+        st.bar_chart(status_df, x="状态", y="数量", height=200, use_container_width=True)
+    else:
+        st.info("暂无心跳数据，点击「发送心跳包」生成数据")
 
-# ✅ 修复：自动心跳也不会移动坐标
+# 自动发送心跳逻辑
 if auto_send:
     time.sleep(1)
     st.session_state.drone_data["sequence"] += 1
+    st.session_state.drone_data["last_receive_time"] = datetime.now()
     st.session_state.drone_data["heartbeats"].append({
         "time": datetime.now().strftime("%H:%M:%S"),
         "seq": st.session_state.drone_data["sequence"],
