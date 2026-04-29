@@ -70,7 +70,6 @@ if "drone_data" not in st.session_state:
 
 # -------------------------- 简易碰撞检测（无需 shapely） --------------------------
 def point_in_polygon(point, polygon):
-    """判断点是否在多边形内"""
     x, y = point
     n = len(polygon)
     inside = False
@@ -84,10 +83,8 @@ def point_in_polygon(point, polygon):
     return inside
 
 def check_path_blocked(start, end, obstacles):
-    """简易路径碰撞检测"""
     lat1, lon1 = start
     lat2, lon2 = end
-    # 取路径上5个点做采样检测
     steps = 5
     for i in range(steps + 1):
         t = i / steps
@@ -182,7 +179,7 @@ with col_left:
             st.session_state.drone_data["avoid_path"] = None
             st.success("✅ 路径通畅，无需绕飞")
 
-# -------------------------- 右侧地图 --------------------------
+# -------------------------- 右侧地图（修复了PolyLine格式错误） --------------------------
 with col_right:
     st.subheader("🗺️ 飞行地图（坐标100%精准）")
     center_lat = (lat_a + lat_b) / 2
@@ -212,8 +209,14 @@ with col_right:
         icon=folium.Icon(color="blue")
     ).add_to(m)
 
-    # 原航线
-    folium.Polyline([[gcj_a[1], gcj_a[0]], [gcj_b[1], gcj_b[0]]], color="blue", weight=3).add_to(m)
+    # ✅ 修复：PolyLine 坐标格式错误
+    folium.PolyLine(
+        locations=[
+            [gcj_a[1], gcj_a[0]],
+            [gcj_b[1], gcj_b[0]]
+        ],
+        color="blue", weight=3, opacity=0.7
+    ).add_to(m)
 
     # 障碍物
     for obs in st.session_state.drone_data["obstacles"]:
@@ -227,10 +230,16 @@ with col_right:
     # 绕飞路线
     if st.session_state.drone_data["avoid_path"]:
         p1, p2 = st.session_state.drone_data["avoid_path"]
-        coords1 = [wgs84_to_gcj02(lon, lat) for lat, lon in p1]
-        coords2 = [wgs84_to_gcj02(lon, lat) for lat, lon in p2]
-        folium.Polyline([[c[1], c[0]] for c in coords1], color="orange", weight=4, dash_array="5,5", popup="左绕飞").add_to(m)
-        folium.Polyline([[c[1], c[0]] for c in coords2], color="purple", weight=4, dash_array="5,5", popup="右绕飞").add_to(m)
+        coords1 = []
+        for lat, lon in p1:
+            g = wgs84_to_gcj02(lon, lat)
+            coords1.append([g[1], g[0]])
+        coords2 = []
+        for lat, lon in p2:
+            g = wgs84_to_gcj02(lon, lat)
+            coords2.append([g[1], g[0]])
+        folium.Polyline(coords1, color="orange", weight=4, dash_array="5,5", popup="左绕飞").add_to(m)
+        folium.Polyline(coords2, color="purple", weight=4, dash_array="5,5", popup="右绕飞").add_to(m)
 
     # 圈选工具
     draw = Draw(draw_options={"polyline": False, "polygon": True, "circle": False, "rectangle": False, "marker": False, "circlemarker": False},
