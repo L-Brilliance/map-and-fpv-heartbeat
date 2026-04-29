@@ -49,16 +49,16 @@ def _transformlng(lng, lat):
     ret += (150.0 * math.sin(lng / 12.0 * pi) + 300.0 * math.sin(lng / 30.0 * pi)) * 2.0 / 3.0
     return ret
 
-# -------------------------- 初始化会话状态（坐标改到校内） --------------------------
+# -------------------------- 初始化会话状态（坐标已锁定在校内） --------------------------
 if "drone_data" not in st.session_state:
     st.session_state.drone_data = {
-        # ✅ 起点/终点坐标已改到你红色框内的校内位置
-        "lat_a": 32.2330,
-        "lon_a": 118.7480,
-        "lat_b": 32.2335,
-        "lon_b": 118.7485,
-        "current_lat": 32.2330,
-        "current_lon": 118.7480,
+        # 起点/终点坐标直接锁定在你学校的核心区域
+        "lat_a": 32.2322,
+        "lon_a": 118.7490,
+        "lat_b": 32.2343,
+        "lon_b": 118.7490,
+        "current_lat": 32.2322,
+        "current_lon": 118.7490,
         "sequence": 0,
         "status": "正常",
         "heartbeats": [],
@@ -66,10 +66,11 @@ if "drone_data" not in st.session_state:
         "obstacles": [],
         "map_tile": "satellite",
         "avoid_path": None,
-        "last_click": None  # 存储地图点击的终点坐标
+        "last_click": None,
+        "mode": "normal"  # 模式切换：normal/obstacle/endpoint
     }
 
-# -------------------------- 简易碰撞检测（无需 shapely） --------------------------
+# -------------------------- 简易碰撞检测 --------------------------
 def point_in_polygon(point, polygon):
     x, y = point
     n = len(polygon)
@@ -110,7 +111,7 @@ def generate_avoid_path(start, end, obs, offset_m=8):
 
 # -------------------------- 页面配置 --------------------------
 st.set_page_config(page_title="无人机避障系统", layout="wide")
-st.title("无人机智能化避障飞行系统（坐标已修正 + 地图选终点）")
+st.title("无人机智能化避障飞行系统（坐标修正版）")
 col_left, col_right = st.columns([1, 2])
 
 # -------------------------- 左侧面板 --------------------------
@@ -126,12 +127,22 @@ with col_left:
         st.session_state.drone_data["current_lon"] = lon_a
         st.success("起点已锁定在校内！")
 
-    st.subheader("🎯 终点设置（可地图点击选择）")
+    st.subheader("🎯 终点设置")
+    # 模式切换按钮，解决冲突
+    mode = st.radio("操作模式", ["正常模式", "选择终点模式", "圈选障碍物模式"])
+    if mode == "选择终点模式":
+        st.info("💡 现在点击地图即可选择终点，选完后请切换回正常模式")
+        st.session_state.drone_data["mode"] = "endpoint"
+    elif mode == "圈选障碍物模式":
+        st.info("💡 现在可以在地图上圈选障碍物，选完后请切换回正常模式")
+        st.session_state.drone_data["mode"] = "obstacle"
+    else:
+        st.session_state.drone_data["mode"] = "normal"
+
     if st.session_state.drone_data["last_click"]:
         click_lat, click_lon = st.session_state.drone_data["last_click"]
         lat_b = st.number_input("终点纬度", value=click_lat, format="%.6f")
         lon_b = st.number_input("终点经度", value=click_lon, format="%.6f")
-        st.info("✅ 已自动填入地图点击的坐标！")
     else:
         lat_b = st.number_input("终点纬度", value=st.session_state.drone_data["lat_b"], format="%.6f")
         lon_b = st.number_input("终点经度", value=st.session_state.drone_data["lon_b"], format="%.6f")
@@ -191,9 +202,9 @@ with col_left:
             st.session_state.drone_data["avoid_path"] = None
             st.success("✅ 路径通畅，无需绕飞")
 
-# -------------------------- 右侧地图（支持点击选终点） --------------------------
+# -------------------------- 右侧地图 --------------------------
 with col_right:
-    st.subheader("🗺️ 飞行地图（点击地图可选择终点）")
+    st.subheader("🗺️ 飞行地图")
     center_lat = (lat_a + lat_b) / 2
     center_lon = (lon_a + lon_b) / 2
     gcj_center = wgs84_to_gcj02(center_lon, center_lat)
@@ -205,11 +216,11 @@ with col_right:
         m = folium.Map(location=[gcj_center[1], gcj_center[0]], zoom_start=18,
                       tiles="https://wprd01.is.autonavi.com/appmaptile?x={x}&y={y}&z={z}&lang=zh_cn&size=1&scl=1&style=8", attr="高德地图")
 
-    # 起点标记
+    # 起点标记（坐标已修正，不偏移）
     gcj_a = wgs84_to_gcj02(lon_a, lat_a)
     folium.Marker([gcj_a[1], gcj_a[0]], popup="起点", icon=folium.Icon(color="red")).add_to(m)
 
-    # 终点标记
+    # 终点标记（坐标已修正，不偏移）
     gcj_b = wgs84_to_gcj02(lon_b, lat_b)
     folium.Marker([gcj_b[1], gcj_b[0]], popup="终点", icon=folium.Icon(color="green")).add_to(m)
 
@@ -253,22 +264,23 @@ with col_right:
         folium.Polyline(coords1, color="orange", weight=4, dash_array="5,5", popup="左绕飞").add_to(m)
         folium.Polyline(coords2, color="purple", weight=4, dash_array="5,5", popup="右绕飞").add_to(m)
 
-    # 圈选工具
-    draw = Draw(draw_options={"polyline": False, "polygon": True, "circle": False, "rectangle": False, "marker": False, "circlemarker": False},
-                edit_options={"edit": True, "remove": True})
-    draw.add_to(m)
+    # 圈选工具：只有在障碍物模式下才显示
+    if st.session_state.drone_data["mode"] == "obstacle":
+        draw = Draw(draw_options={"polyline": False, "polygon": True, "circle": False, "rectangle": False, "marker": False, "circlemarker": False},
+                    edit_options={"edit": True, "remove": True})
+        draw.add_to(m)
 
-    # ✅ 支持地图点击的核心组件
+    # 渲染地图
     map_data = st_folium(m, height=600, width=800)
 
-    # 处理地图点击事件
-    if map_data and "last_clicked" in map_data and map_data["last_clicked"]:
+    # 处理地图点击事件：只有在终点模式下才响应
+    if st.session_state.drone_data["mode"] == "endpoint" and map_data and "last_clicked" in map_data and map_data["last_clicked"]:
         click_lat = map_data["last_clicked"]["lat"]
         click_lon = map_data["last_clicked"]["lng"]
         # GCJ-02转WGS84存起来
         wgs_lon, wgs_lat = gcj02_to_wgs84(click_lon, click_lat)
         st.session_state.drone_data["last_click"] = (wgs_lat, wgs_lon)
-        st.success(f"✅ 已在地图上点击选点：纬度{wgs_lat:.6f}, 经度{wgs_lon:.6f}，请点击「确认终点」按钮！")
+        st.success(f"✅ 已在地图上选择终点：纬度{wgs_lat:.6f}, 经度{wgs_lon:.6f}，请点击「确认终点」！")
 
 # -------------------------- 心跳监测 --------------------------
 st.divider()
