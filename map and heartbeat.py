@@ -21,7 +21,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 持久化（增强版） ====================
+# ==================== 持久化文件 ====================
 STATE_FILE = "ground_station_state.json"
 
 def save_state():
@@ -31,12 +31,10 @@ def save_state():
         "home_point": st.session_state.home_point,
         "waypoints": st.session_state.waypoints,
         "click_mode": st.session_state.click_mode,
-        # 终点坐标（记忆）
         "latA": st.session_state.latA,
         "lngA": st.session_state.lngA,
         "latB": st.session_state.latB,
         "lngB": st.session_state.lngB,
-        # 心跳记忆
         "heartbeat_data": st.session_state.heartbeat_data[-100:],
         "seq": st.session_state.seq,
         "running": st.session_state.running
@@ -50,26 +48,32 @@ def load_state():
             return json.load(f)
     return {}
 
-# ==================== 初始化 ====================
-if "init" not in st.session_state:
+# ==================== 强健的 session_state 初始化 ====================
+def ensure_session_state():
+    defaults = {
+        "obstacles": [],
+        "draw_points": [],
+        "home_point": [32.2335, 118.7475],
+        "waypoints": [],
+        "last_click": None,
+        "click_mode": "障碍物圈选",
+        "latA": 32.233500,
+        "lngA": 118.747500,
+        "latB": 32.233800,
+        "lngB": 118.747900,
+        "heartbeat_data": [],
+        "seq": 0,
+        "running": False,
+    }
     loaded = load_state()
-    st.session_state.obstacles = loaded.get("obstacles", [])
-    st.session_state.draw_points = loaded.get("draw_points", [])
-    st.session_state.home_point = loaded.get("home_point", [32.2335, 118.7475])
-    st.session_state.waypoints = loaded.get("waypoints", [])
-    st.session_state.last_click = None
-    # 模式切换：圈选障碍物 / 选择终点
-    st.session_state.click_mode = loaded.get("click_mode", "障碍物圈选")
-    # 坐标记忆
-    st.session_state.latA = loaded.get("latA", 32.233500)
-    st.session_state.lngA = loaded.get("lngA", 118.747500)
-    st.session_state.latB = loaded.get("latB", 32.233800)
-    st.session_state.lngB = loaded.get("lngB", 118.747900)
-    # 心跳记忆
-    st.session_state.heartbeat_data = loaded.get("heartbeat_data", [])
-    st.session_state.seq = loaded.get("seq", 0)
-    st.session_state.running = loaded.get("running", False)
-    st.session_state.init = True
+    for key, default_value in defaults.items():
+        if key not in st.session_state:
+            # 优先使用文件中的值，没有则用默认值
+            st.session_state[key] = loaded.get(key, default_value)
+    if "init" not in st.session_state:
+        st.session_state.init = True
+
+ensure_session_state()
 
 # ==================== 绕飞路径计算 ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles):
@@ -149,7 +153,7 @@ with col_left:
     st.divider()
 
     if page == "航线规划":
-        # ----- 地图点击模式 -----
+        # 地图点击模式选择
         st.markdown("### 🖱️ 地图点击用途")
         click_mode = st.radio(
             "点击地图时",
@@ -163,7 +167,7 @@ with col_left:
 
         st.divider()
 
-        # ----- 障碍物圈选（原有功能） -----
+        # 障碍物圈选
         st.markdown("### 🚧 障碍物圈选（永久记忆）")
         name = st.text_input("障碍物名称", "教学楼")
         height = st.number_input("高度(m)", min_value=1, max_value=500, value=25, step=1)
@@ -209,33 +213,33 @@ with col_right:
     st.markdown("## 无人机航线导航与监控系统")
 
     if page == "航线规划":
-        # ----- AB点坐标（绑定session_state） -----
+        # AB点坐标（直接使用 session_state 中的值）
         st.markdown("### 🎯 AB点航线")
         c1, c2 = st.columns(2)
         with c1:
-            latA = st.number_input("起点A纬度", value=st.session_state.latA, format="%.6f", key="latA")
-            lngA = st.number_input("起点A经度", value=st.session_state.lngA, format="%.6f", key="lngA")
+            latA = st.number_input("起点A纬度", value=st.session_state.latA, format="%.6f", key="latA_input")
+            lngA = st.number_input("起点A经度", value=st.session_state.lngA, format="%.6f", key="lngA_input")
         with c2:
-            latB = st.number_input("终点B纬度", value=st.session_state.latB, format="%.6f", key="latB")
-            lngB = st.number_input("终点B经度", value=st.session_state.lngB, format="%.6f", key="lngB")
+            latB = st.number_input("终点B纬度", value=st.session_state.latB, format="%.6f", key="latB_input")
+            lngB = st.number_input("终点B经度", value=st.session_state.lngB, format="%.6f", key="lngB_input")
 
-        # 当输入框改变时自动保存状态（key会自动更新session_state，这里手动保存）
-        # 但无需特殊处理，输入框改变后我们会在渲染地图前使用最新值
+        # 更新 session_state 以保持与输入框同步
+        st.session_state.latA = latA
+        st.session_state.lngA = lngA
+        st.session_state.latB = latB
+        st.session_state.lngB = lngB
 
         fly_h = st.number_input("飞行高度(m)", min_value=1, max_value=500, value=50, step=1)
-
-        # ----- 地图模式 -----
         map_type = st.radio("🗺️ 地图模式", ["高德普通地图", "卫星影像地图"], horizontal=True)
 
-        # ----- 计算绕飞路径 -----
+        # 计算绕飞路径
         avoid_pts = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles)
 
-        # ----- 初始化地图 -----
+        # 构建地图
         center_lat = (latA + latB) / 2
         center_lng = (lngA + lngB) / 2
         m = folium.Map(location=[center_lat, center_lng], zoom_start=17, control_scale=True)
 
-        # ----- 图层 -----
         if map_type == "卫星影像地图":
             TileLayer(
                 tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -247,36 +251,35 @@ with col_right:
                 attr="© 高德", name="高德地图", max_zoom=20
             ).add_to(m)
 
-        # ----- 原始航线（红色虚线） -----
+        # 原始航线（红色虚线）
         folium.PolyLine(
             locations=[[latA, lngA], [latB, lngB]],
             color="red", weight=2, opacity=0.6, dash_array="5,5"
         ).add_to(m)
 
-        # ----- 绕飞路径（橙色实线） -----
+        # 绕飞路径（橙色实线）
         if avoid_pts:
             path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in avoid_pts] + [[latB, lngB]]
             folium.PolyLine(locations=path, color="orange", weight=5, opacity=0.9).add_to(m)
 
-        # ----- AB点标记 -----
         folium.Marker([latA, lngA], popup="起点A", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
         folium.Marker([latB, lngB], popup="终点B", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
 
-        # ----- 障碍物（红色半透明） -----
+        # 障碍物
         for ob in st.session_state.obstacles:
             ps = [[lat, lng] for (lng, lat) in ob["points"]]
             folium.Polygon(locations=ps, color="red", fill=True, fill_opacity=0.5,
                            popup=f"{ob['name']} ({ob['height']}m)").add_to(m)
 
-        # ----- 当前圈选临时多边形（蓝色） -----
+        # 当前圈选临时多边形
         if len(st.session_state.draw_points) >= 2:
             ps = [[lat, lng] for (lng, lat) in st.session_state.draw_points]
             folium.Polygon(locations=ps, color="blue", fill=True, fill_opacity=0.2).add_to(m)
 
-        # ----- 地图渲染 -----
+        # 地图渲染
         o = st_folium.st_folium(m, width=1400, height=700, returned_objects=["last_clicked"])
 
-        # ----- 处理点击（根据模式） -----
+        # 处理点击
         if o and o.get("last_clicked"):
             click_lat = o["last_clicked"]["lat"]
             click_lng = o["last_clicked"]["lng"]
@@ -289,15 +292,14 @@ with col_right:
                     save_state()
                     st.rerun()
             else:  # 选择终点模式
-                # 更新终点B坐标
                 st.session_state.latB = round(click_lat, 6)
                 st.session_state.lngB = round(click_lng, 6)
-                st.session_state.last_click = pt  # 避免重复触发
+                st.session_state.last_click = pt
                 save_state()
                 st.rerun()
 
     else:
-        # ==================== 心跳监控（带记忆） ====================
+        # 心跳监控（带记忆）
         st.title("📡 无人机心跳监控")
         c1, c2 = st.columns(2)
         with c1:
