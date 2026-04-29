@@ -68,7 +68,6 @@ def ensure_session_state():
     loaded = load_state()
     for key, default_value in defaults.items():
         if key not in st.session_state:
-            # 优先使用文件中的值，没有则用默认值
             st.session_state[key] = loaded.get(key, default_value)
     if "init" not in st.session_state:
         st.session_state.init = True
@@ -213,17 +212,17 @@ with col_right:
     st.markdown("## 无人机航线导航与监控系统")
 
     if page == "航线规划":
-        # AB点坐标（直接使用 session_state 中的值）
+        # AB点坐标（已移除固定的key，保证与点击终点同步）
         st.markdown("### 🎯 AB点航线")
         c1, c2 = st.columns(2)
         with c1:
-            latA = st.number_input("起点A纬度", value=st.session_state.latA, format="%.6f", key="latA_input")
-            lngA = st.number_input("起点A经度", value=st.session_state.lngA, format="%.6f", key="lngA_input")
+            latA = st.number_input("起点A纬度", value=st.session_state.latA, format="%.6f")
+            lngA = st.number_input("起点A经度", value=st.session_state.lngA, format="%.6f")
         with c2:
-            latB = st.number_input("终点B纬度", value=st.session_state.latB, format="%.6f", key="latB_input")
-            lngB = st.number_input("终点B经度", value=st.session_state.lngB, format="%.6f", key="lngB_input")
+            latB = st.number_input("终点B纬度", value=st.session_state.latB, format="%.6f")
+            lngB = st.number_input("终点B经度", value=st.session_state.lngB, format="%.6f")
 
-        # 更新 session_state 以保持与输入框同步
+        # 双向同步
         st.session_state.latA = latA
         st.session_state.lngA = lngA
         st.session_state.latB = latB
