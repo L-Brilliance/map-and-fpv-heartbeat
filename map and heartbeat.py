@@ -74,8 +74,8 @@ def ensure_session_state():
 
 ensure_session_state()
 
-# ==================== 绕飞路径计算（支持左绕、右绕、最短弧线） ====================
-def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radius=0.0001):
+# ==================== 绕飞路径计算（支持左绕、右绕、真正的弧线最短路径） ====================
+def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radius=0.0002):
     start = (lngA, latA)
     end = (lngB, latB)
     line = LineString([start, end])
@@ -135,32 +135,43 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radiu
     if right_c:
         right_path = [start] + right_c + [end]
 
-    # 生成弧线过渡的最短路径（Dubins风格）
-    def create_arc_path(path_pts, radius):
+    # 生成平滑弧线路径（基于二次贝塞尔曲线，真正的弧线）
+    def create_bezier_arc_path(path_pts, control_scale=0.5):
         if not path_pts or len(path_pts) < 3:
             return []
         arc_path = []
-        for i in range(len(path_pts)-1):
+        # 起点
+        arc_path.append(path_pts[0])
+        # 对每一段路径生成弧线
+        for i in range(1, len(path_pts)-1):
+            p0 = path_pts[i-1]
             p1 = path_pts[i]
             p2 = path_pts[i+1]
-            if i == 0:
-                arc_path.append(p1)
-            if i < len(path_pts)-2:
-                # 生成圆弧过渡点
-                dx = p2[0] - p1[0]
-                dy = p2[1] - p1[1]
-                angle = math.atan2(dy, dx)
-                steps = 5
-                for t in range(1, steps+1):
-                    a = angle + (math.pi/2)*(t/steps)
-                    cx = p1[0] + radius * math.cos(a)
-                    cy = p1[1] + radius * math.sin(a)
-                    arc_path.append((cx, cy))
-            arc_path.append(p2)
+            
+            # 计算控制点
+            dx1 = p1[0] - p0[0]
+            dy1 = p1[1] - p0[1]
+            dx2 = p2[0] - p1[0]
+            dy2 = p2[1] - p1[1]
+            
+            # 控制点取在角平分线上，生成平滑过渡
+            control_x = p1[0] - (dx1 + dx2) * control_scale
+            control_y = p1[1] - (dy1 + dy2) * control_scale
+            
+            # 生成贝塞尔曲线点
+            steps = 10
+            for t in range(1, steps+1):
+                t = t / steps
+                # 二次贝塞尔公式
+                x = (1-t)**2 * p0[0] + 2*(1-t)*t * control_x + t**2 * p2[0]
+                y = (1-t)**2 * p0[1] + 2*(1-t)*t * control_y + t**2 * p2[1]
+                arc_path.append((x, y))
+        # 终点
+        arc_path.append(path_pts[-1])
         return arc_path
 
-    left_arc = create_arc_path(left_path, turn_radius) if left_path else []
-    right_arc = create_arc_path(right_path, turn_radius) if right_path else []
+    left_arc = create_bezier_arc_path(left_path) if left_path else []
+    right_arc = create_bezier_arc_path(right_path) if right_path else []
 
     # 选择最短路径
     def path_len(p):
@@ -174,7 +185,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radiu
 
     # 转为 (lat, lng) 格式
     def to_lat_lng(points):
-        return [(p[1], p[0]) for p in points[1:-1]] if points else []
+        return [(p[1], p[0]) for p in points] if points else []
 
     return {
         "left": to_lat_lng(left_path) if left_path else [],
@@ -309,9 +320,9 @@ with col_right:
             path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in right_pts] + [[latB, lngB]]
             folium.PolyLine(locations=path, color="green", weight=3, opacity=0.8, popup="向右绕飞路径").add_to(m)
 
-        # 最短弧线路径（橙色，实线）
+        # 最短弧线路径（橙色，真正的弧线）
         if shortest_pts:
-            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in shortest_pts] + [[latB, lngB]]
+            path = [[lat, lng] for (lat, lng) in shortest_pts]
             folium.PolyLine(locations=path, color="orange", weight=5, opacity=0.9, popup="最短弧线路径（推荐）").add_to(m)
 
         folium.Marker([latA, lngA], popup="起点A", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
