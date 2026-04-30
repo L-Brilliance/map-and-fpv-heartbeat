@@ -74,8 +74,8 @@ def ensure_session_state():
 
 ensure_session_state()
 
-# ==================== 绕飞路径计算 ====================
-def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles):
+# ==================== 绕飞路径计算（支持左绕、右绕、最短弧线） ====================
+def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radius=0.0001):
     start = (lngA, latA)
     end = (lngB, latB)
     line = LineString([start, end])
@@ -96,7 +96,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles):
             blocking.append((poly, ob_height))
 
     if not blocking:
-        return []
+        return {"left": [], "right": [], "shortest": []}
 
     merged = unary_union([b[0] for b in blocking])
     polys = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
@@ -128,19 +128,59 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles):
     left_c.sort(key=dist)
     right_c.sort(key=dist)
 
-    left_path = [start] + left_c + [end] if left_c else None
-    right_path = [start] + right_c + [end] if right_c else None
+    left_path = None
+    if left_c:
+        left_path = [start] + left_c + [end]
+    right_path = None
+    if right_c:
+        right_path = [start] + right_c + [end]
 
-    if left_path and right_path:
-        len_l = sum(dist(left_path[i+1]) for i in range(len(left_path)-1))
-        len_r = sum(dist(right_path[i+1]) for i in range(len(right_path)-1))
-        chosen = left_path if len_l < len_r else right_path
-    else:
-        chosen = left_path or right_path
+    # 生成弧线过渡的最短路径（Dubins风格）
+    def create_arc_path(path_pts, radius):
+        if not path_pts or len(path_pts) < 3:
+            return []
+        arc_path = []
+        for i in range(len(path_pts)-1):
+            p1 = path_pts[i]
+            p2 = path_pts[i+1]
+            if i == 0:
+                arc_path.append(p1)
+            if i < len(path_pts)-2:
+                # 生成圆弧过渡点
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                angle = math.atan2(dy, dx)
+                steps = 5
+                for t in range(1, steps+1):
+                    a = angle + (math.pi/2)*(t/steps)
+                    cx = p1[0] + radius * math.cos(a)
+                    cy = p1[1] + radius * math.sin(a)
+                    arc_path.append((cx, cy))
+            arc_path.append(p2)
+        return arc_path
 
-    if not chosen:
-        return []
-    return [(p[1], p[0]) for p in chosen[1:-1]]  # (lat, lng)
+    left_arc = create_arc_path(left_path, turn_radius) if left_path else []
+    right_arc = create_arc_path(right_path, turn_radius) if right_path else []
+
+    # 选择最短路径
+    def path_len(p):
+        if not p:
+            return float('inf')
+        return sum(math.hypot(p[i+1][0]-p[i][0], p[i+1][1]-p[i][1]) for i in range(len(p)-1))
+
+    len_l = path_len(left_arc)
+    len_r = path_len(right_arc)
+    shortest_path = left_arc if len_l < len_r else right_arc
+
+    # 转为 (lat, lng) 格式
+    def to_lat_lng(points):
+        return [(p[1], p[0]) for p in points[1:-1]] if points else []
+
+    return {
+        "left": to_lat_lng(left_path) if left_path else [],
+        "right": to_lat_lng(right_path) if right_path else [],
+        "shortest": to_lat_lng(shortest_path) if shortest_path else []
+    }
 
 # ==================== 左侧布局 ====================
 col_left, col_right = st.columns([1, 3])
@@ -231,8 +271,11 @@ with col_right:
         fly_h = st.number_input("飞行高度(m)", min_value=1, max_value=500, value=50, step=1)
         map_type = st.radio("🗺️ 地图模式", ["高德普通地图", "卫星影像地图"], horizontal=True)
 
-        # 计算绕飞路径
-        avoid_pts = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles)
+        # 计算三种绕飞路径
+        paths = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles)
+        left_pts = paths["left"]
+        right_pts = paths["right"]
+        shortest_pts = paths["shortest"]
 
         # 构建地图
         center_lat = (latA + latB) / 2
@@ -253,13 +296,23 @@ with col_right:
         # 原始航线（红色虚线）
         folium.PolyLine(
             locations=[[latA, lngA], [latB, lngB]],
-            color="red", weight=2, opacity=0.6, dash_array="5,5"
+            color="red", weight=2, opacity=0.6, dash_array="5,5", popup="原始直飞航线"
         ).add_to(m)
 
-        # 绕飞路径（橙色实线）
-        if avoid_pts:
-            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in avoid_pts] + [[latB, lngB]]
-            folium.PolyLine(locations=path, color="orange", weight=5, opacity=0.9).add_to(m)
+        # 向左绕飞路径（蓝色）
+        if left_pts:
+            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in left_pts] + [[latB, lngB]]
+            folium.PolyLine(locations=path, color="blue", weight=3, opacity=0.8, popup="向左绕飞路径").add_to(m)
+
+        # 向右绕飞路径（绿色）
+        if right_pts:
+            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in right_pts] + [[latB, lngB]]
+            folium.PolyLine(locations=path, color="green", weight=3, opacity=0.8, popup="向右绕飞路径").add_to(m)
+
+        # 最短弧线路径（橙色，实线）
+        if shortest_pts:
+            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in shortest_pts] + [[latB, lngB]]
+            folium.PolyLine(locations=path, color="orange", weight=5, opacity=0.9, popup="最短弧线路径（推荐）").add_to(m)
 
         folium.Marker([latA, lngA], popup="起点A", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
         folium.Marker([latB, lngB], popup="终点B", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
