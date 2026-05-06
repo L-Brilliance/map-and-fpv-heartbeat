@@ -92,28 +92,26 @@ def xy_to_lonlat(x, y, center_lon, center_lat):
     lat = center_lat + y / meter_per_deg_lat
     return lon, lat
 
-# ==================== 贝塞尔弧线生成（来自用户原始代码） ====================
+# ==================== 贝塞尔弧线（原始） ====================
 def create_bezier_arc_path(path_pts, control_scale=0.5):
     if not path_pts or len(path_pts) < 3:
-        return path_pts  # 退回原折线
-    arc_path = [path_pts[0]]
+        return path_pts
+    arc = [path_pts[0]]
     for i in range(1, len(path_pts)-1):
         p0, p1, p2 = path_pts[i-1], path_pts[i], path_pts[i+1]
         dx1, dy1 = p1[0]-p0[0], p1[1]-p0[1]
         dx2, dy2 = p2[0]-p1[0], p2[1]-p1[1]
-        # 控制点沿角平分线向外偏移
         control_x = p1[0] - (dx1 + dx2) * control_scale
         control_y = p1[1] - (dy1 + dy2) * control_scale
-        steps = 10
-        for t in range(1, steps+1):
-            t = t / steps
+        for t in range(1, 11):
+            t = t/10
             x = (1-t)**2 * p0[0] + 2*(1-t)*t * control_x + t**2 * p2[0]
             y = (1-t)**2 * p0[1] + 2*(1-t)*t * control_y + t**2 * p2[1]
-            arc_path.append((x, y))
-    arc_path.append(path_pts[-1])
-    return arc_path
+            arc.append((x, y))
+    arc.append(path_pts[-1])
+    return arc
 
-# ==================== 核心绕飞算法 ====================
+# ==================== 核心绕飞（最终版） ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     if not obstacles:
         return {"left": [], "right": [], "shortest": []}
@@ -122,7 +120,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
     end_xy = lonlat_to_xy(lngB, latB, center_lon, center_lat)
 
-    # 1. 构建所有障碍物的安全缓冲区（米制）
+    # 1. 安全缓冲区
     buffers = []
     for ob in obstacles:
         if fly_height >= ob.get("height", 0):
@@ -143,17 +141,15 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     merged = unary_union(buffers)
     direct_line = LineString([start_xy, end_xy])
 
-    # 无冲突直接返回直线
     if not direct_line.intersects(merged):
         straight = [(latA, lngA), (latB, lngB)]
         return {"left": straight, "right": straight, "shortest": straight}
 
-    # 2. 使用凸包边界（凸多边形保证边界完全在缓冲区外部且路径最短）
-    hull = merged.convex_hull
-    boundary = hull.exterior
-    boundary_coords = list(boundary.coords)
+    # 2. 使用合并缓冲区的精确外边界（不是凸包）
+    boundary = merged.exterior
+    coords = list(boundary.coords)
 
-    # 3. 找到与直线的两个交点
+    # 3. 求交点
     intersection = boundary.intersection(direct_line)
     pts = []
     if isinstance(intersection, Point):
@@ -161,11 +157,13 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     elif isinstance(intersection, MultiPoint):
         pts = list(intersection.geoms)
     if len(pts) < 2:
-        # 如果交点不足，延伸直线再试
+        # 延伸直线
         dx = end_xy[0] - start_xy[0]
         dy = end_xy[1] - start_xy[1]
-        ext_line = LineString([(start_xy[0] - dx*0.01, start_xy[1] - dy*0.01),
-                               (end_xy[0] + dx*0.01, end_xy[1] + dy*0.01)])
+        ext_line = LineString([
+            (start_xy[0] - dx*0.01, start_xy[1] - dy*0.01),
+            (end_xy[0] + dx*0.01, end_xy[1] + dy*0.01)
+        ])
         intersection = boundary.intersection(ext_line)
         if isinstance(intersection, Point):
             pts = [intersection]
@@ -174,81 +172,83 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         if len(pts) < 2:
             return {"left": [], "right": [], "shortest": []}
 
-    # 按直线方向排序
     pts.sort(key=lambda p: direct_line.project(p))
-    entry_pt = pts[0]
-    exit_pt = pts[-1]
+    entry = pts[0]
+    exit_ = pts[-1]
 
-    # 4. 找到交点在边界坐标列表中的索引
-    def find_nearest_idx(pt, coords_list):
-        min_d, idx = float('inf'), 0
-        for i, (x, y) in enumerate(coords_list):
+    # 4. 找到交点在边界坐标中的索引
+    def nearest_idx(pt, coords):
+        best = float('inf')
+        idx = 0
+        for i, (x, y) in enumerate(coords):
             d = math.hypot(x - pt.x, y - pt.y)
-            if d < min_d:
-                min_d, idx = d, i
+            if d < best:
+                best, idx = d, i
         return idx
 
-    idx_entry = find_nearest_idx(entry_pt, boundary_coords)
-    idx_exit = find_nearest_idx(exit_pt, boundary_coords)
+    i_entry = nearest_idx(entry, coords)
+    i_exit = nearest_idx(exit_, coords)
 
-    # 5. 沿边界取两段：不能简化，直接用原始坐标保证距离
-    if idx_entry <= idx_exit:
-        seg1 = boundary_coords[idx_entry:idx_exit+1]
-        seg2 = boundary_coords[idx_exit:] + boundary_coords[:idx_entry+1]
+    # 5. 边界两段
+    if i_entry <= i_exit:
+        seg1 = coords[i_entry:i_exit+1]
+        seg2 = coords[i_exit:] + coords[:i_entry+1]
     else:
-        seg1 = boundary_coords[idx_entry:] + boundary_coords[:idx_exit+1]
-        seg2 = boundary_coords[idx_exit:idx_entry+1]
+        seg1 = coords[i_entry:] + coords[:i_exit+1]
+        seg2 = coords[i_exit:i_entry+1]
 
-    # 6. 判断左右段：叉积方向
+    # 6. 判定左右：叉积
     dir_vec = (end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
-    def cross_z(pt):
+    def cross(pt):
         vx, vy = pt[0] - start_xy[0], pt[1] - start_xy[1]
         return dir_vec[0]*vy - dir_vec[1]*vx
 
-    # 取段中间点进行判断
+    # 取中点判定
     mid1 = seg1[len(seg1)//2]
     mid2 = seg2[len(seg2)//2]
-    z1 = cross_z(mid1)
-    z2 = cross_z(mid2)
-
-    # 左侧叉积 > 0（假设坐标系为右手，具体符号可由测试确定，我们直接用最大值作为左侧）
-    # 一种更简单的方法：我们定义左侧为叉积最大的那一段
-    if z1 > z2:
-        left_seg_raw, right_seg_raw = seg1, seg2
+    if cross(mid1) > cross(mid2):
+        left_seg = seg1
+        right_seg = seg2
     else:
-        left_seg_raw, right_seg_raw = seg2, seg1
+        left_seg = seg2
+        right_seg = seg1
 
-    # 7. 构建带入口出口的绕行点序列
-    left_points = [start_xy, (entry_pt.x, entry_pt.y)] + left_seg_raw[1:-1] + [(exit_pt.x, exit_pt.y), end_xy]
-    right_points = [start_xy, (entry_pt.x, entry_pt.y)] + right_seg_raw[1:-1] + [(exit_pt.x, exit_pt.y), end_xy]
+    # 7. 构建带入口出口的完整路径（不简化）
+    entry_pt = (entry.x, entry.y)
+    exit_pt = (exit_.x, exit_.y)
 
-    # 8. 生成贝塞尔弧线
-    left_arc = create_bezier_arc_path(left_points, control_scale=0.5)
-    right_arc = create_bezier_arc_path(right_points, control_scale=0.5)
+    left_path = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
+    right_path = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
 
-    # 9. 安全检查：若弧线侵入缓冲区，则回退到折线
-    def is_path_safe(path_xy, merged_obj, tolerance=0.2):
-        """检查路径所有点是否在缓冲区外部（允许微小误差）"""
-        for x, y in path_xy:
+    # 8. 贝塞尔弧线
+    left_arc = create_bezier_arc_path(left_path)
+    right_arc = create_bezier_arc_path(right_path)
+
+    # 9. 安全检查
+    def safe(path, merged_obj):
+        for x, y in path:
             pt = Point(x, y)
-            if pt.within(merged_obj) or pt.distance(merged_obj) < tolerance:
+            if pt.within(merged_obj) or pt.distance(merged_obj) < 0.5:  # 0.5米安全余量
                 return False
         return True
 
-    final_left = left_arc if is_path_safe(left_arc, merged) else left_points
-    final_right = right_arc if is_path_safe(right_arc, merged) else right_points
+    final_left = left_arc if safe(left_arc, merged) else left_path
+    final_right = right_arc if safe(right_arc, merged) else right_path
 
-    # 10. 转回经纬度 (lat, lon)
+    # 10. 转经纬度
     def to_latlon(xy_list):
-        return [(xy_to_lonlat(x, y, center_lon, center_lat)[1],
-                 xy_to_lonlat(x, y, center_lon, center_lat)[0]) for x, y in xy_list]
+        res = []
+        for x, y in xy_list:
+            lon, lat = xy_to_lonlat(x, y, center_lon, center_lat)
+            res.append((lat, lon))
+        return res
 
     left_latlon = to_latlon(final_left)
     right_latlon = to_latlon(final_right)
 
-    # 11. 计算路径长度，选最短
     def path_len(waypoints):
-        if not waypoints: return float('inf')
+        if len(waypoints) < 2:
+            return float('inf')
         return sum(haversine(waypoints[i][0], waypoints[i][1],
                              waypoints[i+1][0], waypoints[i+1][1]) for i in range(len(waypoints)-1))
 
@@ -331,11 +331,14 @@ with col_right:
         map_type = st.radio("🗺️ 地图模式", ["高德普通地图", "卫星影像地图"], horizontal=True)
 
         paths = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles, st.session_state.safety_radius)
-        left_pts, right_pts, shortest_pts = paths["left"], paths["right"], paths["shortest"]
+        left_pts = paths["left"]
+        right_pts = paths["right"]
+        shortest_pts = paths["shortest"]
 
         center_lat = (latA + latB) / 2
         center_lng = (lngA + lngB) / 2
         m = folium.Map(location=[center_lat, center_lng], zoom_start=17, control_scale=True)
+
         if map_type == "卫星影像地图":
             TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
                       attr="Esri", name="卫星影像", max_zoom=20).add_to(m)
@@ -394,7 +397,7 @@ with col_right:
                 st.success("直飞航线已设置。")
 
     else:
-        # ==================== 飞行监控（保持原有逻辑不变） ====================
+        # ==================== 飞行监控（保持原有） ====================
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
         st.markdown("### 📡 通信链路拓扑与数据流")
         cols = st.columns(4)
@@ -419,7 +422,8 @@ with col_right:
                 c1, c2 = st.columns(2)
                 c1.button("▶️ 开始任务", disabled=True)
                 if c2.button("⏸️ 暂停任务", use_container_width=True):
-                    elapsed = (datetime.datetime.now() - st.session_state.flight_start_time).total_seconds() - st.session_state.flight_paused_duration
+                    now = datetime.datetime.now()
+                    elapsed = (now - st.session_state.flight_start_time).total_seconds() - st.session_state.flight_paused_duration
                     st.session_state.flight_paused_duration += elapsed
                     st.session_state.flight_status = "paused"
                     save_state()
@@ -449,8 +453,8 @@ with col_right:
                 remain = total_dist - flown
 
                 cum = 0
-                idx = 0
                 cur_lat, cur_lon = wp_list[0]
+                idx = 0
                 for i in range(len(wp_list)-1):
                     d = haversine(wp_list[i][0], wp_list[i][1], wp_list[i+1][0], wp_list[i+1][1])
                     if cum + d >= flown:
