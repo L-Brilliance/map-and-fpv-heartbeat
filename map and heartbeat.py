@@ -8,9 +8,8 @@ import datetime
 import json
 import os
 import math
-from shapely.geometry import Polygon, LineString, Point, MultiLineString, MultiPoint
-from shapely.ops import unary_union, split, nearest_points
-from shapely import affinity
+from shapely.geometry import Polygon, LineString, Point, MultiPoint, MultiLineString
+from shapely.ops import unary_union
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="南京科技职业学院 - 无人机导航系统", layout="wide")
@@ -111,7 +110,7 @@ def xy_to_lonlat(x, y, center_lon, center_lat):
     lat = center_lat + y / meter_per_deg_lat
     return lon, lat
 
-# ==================== 安全绕飞路径算法（左右侧多条拐弯） ====================
+# ==================== 绕飞路径计算（安全距离 + 左右侧多条拐弯） ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     if not obstacles:
         return {"left": [], "right": [], "shortest": []}
@@ -120,7 +119,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
     end_xy = lonlat_to_xy(lngB, latB, center_lon, center_lat)
 
-    # 构建所有障碍物缓冲区（米制）
+    # 构建所有障碍物安全缓冲区
     all_buffers = []
     for ob in obstacles:
         if fly_height >= ob.get("height", 0):
@@ -135,22 +134,19 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         all_buffers.append(poly.buffer(safety_radius_m))
 
     if not all_buffers:
-        # 无高度冲突，直接返回直线
-        return {
-            "left": [],
-            "right": [],
-            "shortest": [(latA, lngA), (latB, lngB)]
-        }
+        straight = [(latA, lngA), (latB, lngB)]
+        return {"left": straight, "right": straight, "shortest": straight}
 
     merged = unary_union(all_buffers)
     direct_line = LineString([start_xy, end_xy])
 
-    # 若无相交，最短路径就是直线，左右路径也提供一条（可选直线）
+    # 若无相交，直接返回直线
     if not direct_line.intersects(merged):
         straight = [(latA, lngA), (latB, lngB)]
         return {"left": straight, "right": straight, "shortest": straight}
 
-    # 获取合并缓冲区的外边界（正方向逆时针）和外边界（孔洞不计）
+    # 获取合并缓冲区的边界
+    boundaries = []
     if merged.geom_type == 'Polygon':
         boundaries = [merged.exterior]
     elif merged.geom_type == 'MultiPolygon':
@@ -158,100 +154,86 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     else:
         boundaries = [merged.boundary] if merged.boundary else []
 
-    # 沿着边界生成绕行路径：对于每个障碍物边界，找出直线与边界的交点，将边界分成两段，提供左右绕行
-    left_paths = []
-    right_paths = []
+    left_paths, right_paths = [], []
 
     for boundary in boundaries:
-        # 计算直线与边界的交点
         intersection = boundary.intersection(direct_line)
         if intersection.is_empty:
             continue
-        # 将交点转换为点列表
+
+        # 收集所有交点（Point / MultiPoint）
+        pts_list = []
         if isinstance(intersection, Point):
             pts_list = [intersection]
         elif isinstance(intersection, MultiPoint):
             pts_list = list(intersection.geoms)
-        elif isinstance(intersection, (LineString, MultiLineString)):
-            # 如果重合，略过
-            continue
-        else:
-            continue
-
+        elif hasattr(intersection, 'geoms'):  # GeometryCollection 等
+            for geom in intersection.geoms:
+                if isinstance(geom, Point):
+                    pts_list.append(geom)
         if len(pts_list) < 2:
             continue
 
         # 沿直线方向排序交点
         pts_list.sort(key=lambda p: direct_line.project(p))
-        # 取第一个和最后一个交点作为切点
         p_entry = pts_list[0]
         p_exit = pts_list[-1]
 
         coords = list(boundary.coords)
 
-        # 找到 p_entry 和 p_exit 在边界上的位置
+        # 找到交点在边界上的最近索引
         def nearest_index(point, coords):
-            min_dist = float('inf')
-            idx = 0
+            min_dist, idx = float('inf'), 0
             for i, (x, y) in enumerate(coords):
                 d = math.hypot(x - point.x, y - point.y)
                 if d < min_dist:
-                    min_dist = d
-                    idx = i
+                    min_dist, idx = d, i
             return idx
 
         idx_entry = nearest_index(p_entry, coords)
         idx_exit = nearest_index(p_exit, coords)
 
-        # 生成两条路径：顺时针方向和逆时针方向沿着边界
-        # 确保索引顺序
+        # 分割边界为两段
         if idx_entry <= idx_exit:
-            segment1 = coords[idx_entry:idx_exit+1]  # 从 entry 到 exit 顺时针/逆时针？取决于多边形方向
-            segment2 = coords[idx_exit:] + coords[:idx_entry+1]  # 另一边
+            seg1 = coords[idx_entry:idx_exit+1]
+            seg2 = coords[idx_exit:] + coords[:idx_entry+1]
         else:
-            segment1 = coords[idx_entry:] + coords[:idx_exit+1]
-            segment2 = coords[idx_exit:idx_entry+1]
+            seg1 = coords[idx_entry:] + coords[:idx_exit+1]
+            seg2 = coords[idx_exit:idx_entry+1]
 
-        # 判断哪一段是左绕：根据 cross product 矢量叉积，若从起点到终点向量为 dir，则左绕点应在 dir 的左侧
+        # 判断左侧 / 右侧
         dir_vec = (end_xy[0]-start_xy[0], end_xy[1]-start_xy[1])
         def side_of_point(pt):
             v = (pt[0]-start_xy[0], pt[1]-start_xy[1])
             return dir_vec[0]*v[1] - dir_vec[1]*v[0]
 
-        # 计算两段中间点的侧向（取非端点的点）
-        mid_idx1 = len(segment1)//2
-        if len(segment1) < 3:
-            side1 = side_of_point(segment1[0])  # 近似
+        mid1 = seg1[len(seg1)//2] if len(seg1) > 1 else seg1[0]
+        if side_of_point(mid1) > 0:
+            left_seg_raw, right_seg_raw = seg1, seg2
         else:
-            side1 = side_of_point(segment1[mid_idx1])
+            left_seg_raw, right_seg_raw = seg2, seg1
 
-        if side1 > 0:
-            left_seg = segment1
-            right_seg = segment2
-        else:
-            left_seg = segment2
-            right_seg = segment1
-
-        # 将边界段简化（去除太密集的点，保留拐弯特征）
-        def simplify_path(pts, tolerance=1.0):
+        # 简化路径（每隔2米保留一个拐点）
+        def simplify_path(pts, tol=2.0):
             if len(pts) <= 2:
                 return pts
-            # 简单道格拉斯-普克，此处用每隔一定距离采样替代
-            result = [pts[0]]
+            res = [pts[0]]
             for i in range(1, len(pts)-1):
-                if math.hypot(pts[i][0]-result[-1][0], pts[i][1]-result[-1][1]) >= tolerance:
-                    result.append(pts[i])
-            result.append(pts[-1])
-            return result
+                if math.hypot(pts[i][0]-res[-1][0], pts[i][1]-res[-1][1]) >= tol:
+                    res.append(pts[i])
+            res.append(pts[-1])
+            return res
 
-        left_seg = simplify_path(left_seg, tolerance=2.0)   # 2米一个拐点
-        right_seg = simplify_path(right_seg, tolerance=2.0)
+        left_seg = simplify_path(left_seg_raw, 2.0)
+        right_seg = simplify_path(right_seg_raw, 2.0)
 
-        # 构建完整路径：起点 -> 左侧入口 -> 左侧边界段 -> 出口 -> 终点
-        left_path = [start_xy] + [p_entry] + left_seg[1:-1] + [p_exit] + [end_xy]
-        right_path = [start_xy] + [p_entry] + right_seg[1:-1] + [p_exit] + [end_xy]
+        # 关键修复：将 Shapely Point 对象转为元组 (x, y)
+        entry_pt = (p_entry.x, p_entry.y)
+        exit_pt = (p_exit.x, p_exit.y)
 
-        # 转为经纬度
+        left_path_xy = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
+        right_path_xy = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
+
         def xy_to_latlon_list(xy_list):
             res = []
             for x, y in xy_list:
@@ -259,23 +241,19 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
                 res.append((lat, lon))
             return res
 
-        left_paths.append(xy_to_latlon_list(left_path))
-        right_paths.append(xy_to_latlon_list(right_path))
+        left_paths.append(xy_to_latlon_list(left_path_xy))
+        right_paths.append(xy_to_latlon_list(right_path_xy))
 
-    # 如果有多个障碍物，路径需要合并（简单串联）
-    # 这里简化处理：只取第一个障碍物生成的左右路径
     final_left = left_paths[0] if left_paths else []
     final_right = right_paths[0] if right_paths else []
 
-    # 最短路径：比较左右长度，选择短的
+    # 计算路径长度
     def path_len(waypoints):
         if not waypoints:
             return float('inf')
-        length = 0
-        for i in range(len(waypoints)-1):
-            length += haversine(waypoints[i][0], waypoints[i][1],
-                                waypoints[i+1][0], waypoints[i+1][1])
-        return length
+        return sum(haversine(waypoints[i][0], waypoints[i][1],
+                             waypoints[i+1][0], waypoints[i+1][1])
+                   for i in range(len(waypoints)-1))
 
     shortest = final_left if path_len(final_left) < path_len(final_right) else final_right
 
@@ -462,7 +440,7 @@ with col_right:
                     save_state()
                     st.success("航线已设置，请切换到“飞行监控”。")
             with col_btn2:
-                # 也可以让用户选择左绕或右绕
+                # 可拓展选左/右
                 pass
         else:
             if st.button("🛩️ 使用直飞航线", use_container_width=True):
@@ -472,7 +450,7 @@ with col_right:
                 st.success("直飞航线已设置。")
 
     else:
-        # ==================== 飞行监控页面（完整） ====================
+        # ==================== 飞行监控页面 ====================
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
 
         # 通信链路
@@ -484,9 +462,6 @@ with col_right:
             st.success("🟢 OBC在线")
         with link_cols[2]:
             st.success("🟢 FCU在线")
-        with link_cols[3]:
-            # 电量单独放后面
-            pass
 
         waypoints = st.session_state.waypoints
         if not waypoints:
@@ -533,7 +508,7 @@ with col_right:
                 with col3:
                     st.button("⏸️ 暂停任务", disabled=True, use_container_width=True)
 
-            # 飞行动态模拟
+            # 飞行动态计算
             if st.session_state.flight_status in ("running", "paused"):
                 wp_list = waypoints
                 total_dist = 0.0
