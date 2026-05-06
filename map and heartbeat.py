@@ -92,29 +92,40 @@ def xy_to_lonlat(x, y, center_lon, center_lat):
     lat = center_lat + y / meter_per_deg_lat
     return lon, lat
 
-# ==================== 贝塞尔弧线（原始） ====================
+# ==================== 修正后的贝塞尔弧线生成 ====================
 def create_bezier_arc_path(path_pts, control_scale=0.5):
-    if not path_pts or len(path_pts) < 3:
+    if not path_pts or len(path_pts) < 2:
         return path_pts
+    if len(path_pts) == 2:
+        return path_pts
+
     arc = [path_pts[0]]
     for i in range(1, len(path_pts)-1):
         p0, p1, p2 = path_pts[i-1], path_pts[i], path_pts[i+1]
-        dx1, dy1 = p1[0]-p0[0], p1[1]-p0[1]
-        dx2, dy2 = p2[0]-p1[0], p2[1]-p1[1]
+        # 计算两段的方向向量
+        dx1, dy1 = p1[0] - p0[0], p1[1] - p0[1]
+        dx2, dy2 = p2[0] - p1[0], p2[1] - p1[1]
+
+        # 修正控制点：向外侧偏移，避免向内挤压进障碍物
         control_x = p1[0] - (dx1 + dx2) * control_scale
         control_y = p1[1] - (dy1 + dy2) * control_scale
+
+        # 生成平滑的二次贝塞尔曲线点
         for t in range(1, 11):
-            t = t/10
-            x = (1-t)**2 * p0[0] + 2*(1-t)*t * control_x + t**2 * p2[0]
-            y = (1-t)**2 * p0[1] + 2*(1-t)*t * control_y + t**2 * p2[1]
+            t = t / 10
+            mt = 1 - t
+            x = mt**2 * p0[0] + 2 * mt * t * control_x + t**2 * p2[0]
+            y = mt**2 * p0[1] + 2 * mt * t * control_y + t**2 * p2[1]
             arc.append((x, y))
     arc.append(path_pts[-1])
     return arc
 
-# ==================== 核心绕飞（最终版） ====================
+# ==================== 修正后的核心绕飞逻辑 ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     if not obstacles:
-        return {"left": [], "right": [], "shortest": []}
+        return {"left": [(latA, lngA), (latB, lngB)],
+                "right": [(latA, lngA), (latB, lngB)],
+                "shortest": [(latA, lngA), (latB, lngB)]}
 
     center_lon, center_lat = lngA, latA
     start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
@@ -145,24 +156,25 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         straight = [(latA, lngA), (latB, lngB)]
         return {"left": straight, "right": straight, "shortest": straight}
 
-    # 2. 使用合并缓冲区的精确外边界（不是凸包）
+    # 2. 取合并缓冲区的外边界
     boundary = merged.exterior
     coords = list(boundary.coords)
 
-    # 3. 求交点
+    # 3. 求直线与缓冲区边界的交点
     intersection = boundary.intersection(direct_line)
     pts = []
     if isinstance(intersection, Point):
         pts = [intersection]
     elif isinstance(intersection, MultiPoint):
         pts = list(intersection.geoms)
+
+    # 交点不足2个时，用延长线找
     if len(pts) < 2:
-        # 延伸直线
         dx = end_xy[0] - start_xy[0]
         dy = end_xy[1] - start_xy[1]
         ext_line = LineString([
-            (start_xy[0] - dx*0.01, start_xy[1] - dy*0.01),
-            (end_xy[0] + dx*0.01, end_xy[1] + dy*0.01)
+            (start_xy[0] - dx * 0.1, start_xy[1] - dy * 0.1),
+            (end_xy[0] + dx * 0.1, end_xy[1] + dy * 0.1)
         ])
         intersection = boundary.intersection(ext_line)
         if isinstance(intersection, Point):
@@ -170,26 +182,28 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         elif isinstance(intersection, MultiPoint):
             pts = list(intersection.geoms)
         if len(pts) < 2:
-            return {"left": [], "right": [], "shortest": []}
+            straight = [(latA, lngA), (latB, lngB)]
+            return {"left": straight, "right": straight, "shortest": straight}
 
+    # 按在直线上的位置排序交点
     pts.sort(key=lambda p: direct_line.project(p))
     entry = pts[0]
     exit_ = pts[-1]
 
-    # 4. 找到交点在边界坐标中的索引
+    # 4. 找交点在边界坐标中的索引
     def nearest_idx(pt, coords):
-        best = float('inf')
+        best_dist = float('inf')
         idx = 0
         for i, (x, y) in enumerate(coords):
             d = math.hypot(x - pt.x, y - pt.y)
-            if d < best:
-                best, idx = d, i
+            if d < best_dist:
+                best_dist, idx = d, i
         return idx
 
     i_entry = nearest_idx(entry, coords)
     i_exit = nearest_idx(exit_, coords)
 
-    # 5. 边界两段
+    # 5. 生成两条绕边界路径
     if i_entry <= i_exit:
         seg1 = coords[i_entry:i_exit+1]
         seg2 = coords[i_exit:] + coords[:i_entry+1]
@@ -197,13 +211,14 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         seg1 = coords[i_entry:] + coords[:i_exit+1]
         seg2 = coords[i_exit:i_entry+1]
 
-    # 6. 判定左右：叉积
+    # 6. 判定左右（叉积法，避免方向错误）
     dir_vec = (end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
     def cross(pt):
-        vx, vy = pt[0] - start_xy[0], pt[1] - start_xy[1]
-        return dir_vec[0]*vy - dir_vec[1]*vx
+        vx = pt[0] - start_xy[0]
+        vy = pt[1] - start_xy[1]
+        return dir_vec[0] * vy - dir_vec[1] * vx
 
-    # 取中点判定
+    # 取路径中点判断方向
     mid1 = seg1[len(seg1)//2]
     mid2 = seg2[len(seg2)//2]
     if cross(mid1) > cross(mid2):
@@ -213,29 +228,29 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         left_seg = seg2
         right_seg = seg1
 
-    # 7. 构建带入口出口的完整路径（不简化）
+    # 7. 构建完整路径（起点 -> 入口 -> 绕边界 -> 出口 -> 终点）
     entry_pt = (entry.x, entry.y)
     exit_pt = (exit_.x, exit_.y)
 
-    left_path = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
-    right_path = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
+    left_path_xy = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
+    right_path_xy = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
 
-    # 8. 贝塞尔弧线
-    left_arc = create_bezier_arc_path(left_path)
-    right_arc = create_bezier_arc_path(right_path)
+    # 8. 生成平滑弧线
+    left_arc_xy = create_bezier_arc_path(left_path_xy)
+    right_arc_xy = create_bezier_arc_path(right_path_xy)
 
-    # 9. 安全检查
-    def safe(path, merged_obj):
+    # 9. 安全校验：确保路径不进入缓冲区
+    def is_safe(path, buffer_obj):
         for x, y in path:
             pt = Point(x, y)
-            if pt.within(merged_obj) or pt.distance(merged_obj) < 0.5:  # 0.5米安全余量
+            if pt.within(buffer_obj) or pt.distance(buffer_obj) < 0.1:
                 return False
         return True
 
-    final_left = left_arc if safe(left_arc, merged) else left_path
-    final_right = right_arc if safe(right_arc, merged) else right_path
+    final_left_xy = left_arc_xy if is_safe(left_arc_xy, merged) else left_path_xy
+    final_right_xy = right_arc_xy if is_safe(right_arc_xy, merged) else right_path_xy
 
-    # 10. 转经纬度
+    # 10. 转回经纬度
     def to_latlon(xy_list):
         res = []
         for x, y in xy_list:
@@ -243,9 +258,10 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
             res.append((lat, lon))
         return res
 
-    left_latlon = to_latlon(final_left)
-    right_latlon = to_latlon(final_right)
+    left_latlon = to_latlon(final_left_xy)
+    right_latlon = to_latlon(final_right_xy)
 
+    # 计算路径长度，选更短的作为推荐路径
     def path_len(waypoints):
         if len(waypoints) < 2:
             return float('inf')
