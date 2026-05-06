@@ -110,7 +110,7 @@ def xy_to_lonlat(x, y, center_lon, center_lat):
     lat = center_lat + y / meter_per_deg_lat
     return lon, lat
 
-# ==================== 绕飞路径计算（安全距离 + 左右侧多条拐弯） ====================
+# ==================== 新绕飞算法：凸包弧线，左右路径清晰 ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     if not obstacles:
         return {"left": [], "right": [], "shortest": []}
@@ -119,7 +119,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
     end_xy = lonlat_to_xy(lngB, latB, center_lon, center_lat)
 
-    # 构建所有障碍物安全缓冲区
+    # 所有障碍物缓冲区
     all_buffers = []
     for ob in obstacles:
         if fly_height >= ob.get("height", 0):
@@ -140,112 +140,118 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     merged = unary_union(all_buffers)
     direct_line = LineString([start_xy, end_xy])
 
-    # 若无相交，直接返回直线
+    # 无冲突，直飞
     if not direct_line.intersects(merged):
         straight = [(latA, lngA), (latB, lngB)]
         return {"left": straight, "right": straight, "shortest": straight}
 
-    # 获取合并缓冲区的边界
-    boundaries = []
-    if merged.geom_type == 'Polygon':
-        boundaries = [merged.exterior]
-    elif merged.geom_type == 'MultiPolygon':
-        boundaries = [poly.exterior for poly in merged.geoms]
+    # 使用凸包获得平滑的外围弧线
+    hull = merged.convex_hull
+    if hull.is_empty or hull.geom_type not in ('Polygon', 'MultiPolygon'):
+        # 退化情况，回退到原始缓冲区边界
+        boundary = merged.boundary if merged.boundary else None
+        if boundary is None:
+            return {"left": [], "right": [], "shortest": []}
     else:
-        boundaries = [merged.boundary] if merged.boundary else []
+        boundary = hull.exterior
 
-    left_paths, right_paths = [], []
+    # 直线与凸包边界的交点
+    intersection = boundary.intersection(direct_line)
+    pts_list = []
+    if isinstance(intersection, Point):
+        pts_list = [intersection]
+    elif isinstance(intersection, MultiPoint):
+        pts_list = list(intersection.geoms)
+    elif hasattr(intersection, 'geoms'):
+        for g in intersection.geoms:
+            if isinstance(g, Point):
+                pts_list.append(g)
 
-    for boundary in boundaries:
-        intersection = boundary.intersection(direct_line)
-        if intersection.is_empty:
-            continue
-
-        # 收集所有交点（Point / MultiPoint）
+    if len(pts_list) < 2:
+        # 特殊情况：直线可能擦边，尝试延伸直线再求交
+        ext_line = LineString([
+            Point(start_xy[0] - (end_xy[0]-start_xy[0])*0.01,
+                 start_xy[1] - (end_xy[1]-start_xy[1])*0.01),
+            Point(end_xy[0] + (end_xy[0]-start_xy[0])*0.01,
+                 end_xy[1] + (end_xy[1]-start_xy[1])*0.01)
+        ])
+        intersection = boundary.intersection(ext_line)
         pts_list = []
         if isinstance(intersection, Point):
             pts_list = [intersection]
         elif isinstance(intersection, MultiPoint):
             pts_list = list(intersection.geoms)
-        elif hasattr(intersection, 'geoms'):  # GeometryCollection 等
-            for geom in intersection.geoms:
-                if isinstance(geom, Point):
-                    pts_list.append(geom)
         if len(pts_list) < 2:
-            continue
+            # 仍然不足，放弃绕飞
+            return {"left": [], "right": [], "shortest": []}
 
-        # 沿直线方向排序交点
-        pts_list.sort(key=lambda p: direct_line.project(p))
-        p_entry = pts_list[0]
-        p_exit = pts_list[-1]
+    pts_list.sort(key=lambda p: direct_line.project(p))
+    p1, p2 = pts_list[0], pts_list[-1]
 
-        coords = list(boundary.coords)
+    # 凸包边界坐标
+    coords = list(boundary.coords)
 
-        # 找到交点在边界上的最近索引
-        def nearest_index(point, coords):
-            min_dist, idx = float('inf'), 0
-            for i, (x, y) in enumerate(coords):
-                d = math.hypot(x - point.x, y - point.y)
-                if d < min_dist:
-                    min_dist, idx = d, i
-            return idx
+    def nearest_index(point, coords):
+        min_dist, idx = float('inf'), 0
+        for i, (x, y) in enumerate(coords):
+            d = math.hypot(x - point.x, y - point.y)
+            if d < min_dist:
+                min_dist, idx = d, i
+        return idx
 
-        idx_entry = nearest_index(p_entry, coords)
-        idx_exit = nearest_index(p_exit, coords)
+    idx1 = nearest_index(p1, coords)
+    idx2 = nearest_index(p2, coords)
 
-        # 分割边界为两段
-        if idx_entry <= idx_exit:
-            seg1 = coords[idx_entry:idx_exit+1]
-            seg2 = coords[idx_exit:] + coords[:idx_entry+1]
-        else:
-            seg1 = coords[idx_entry:] + coords[:idx_exit+1]
-            seg2 = coords[idx_exit:idx_entry+1]
+    # 边界分成两段
+    if idx1 <= idx2:
+        segA = coords[idx1:idx2+1]
+        segB = coords[idx2:] + coords[:idx1+1]
+    else:
+        segA = coords[idx1:] + coords[:idx2+1]
+        segB = coords[idx2:idx1+1]
 
-        # 判断左侧 / 右侧
-        dir_vec = (end_xy[0]-start_xy[0], end_xy[1]-start_xy[1])
-        def side_of_point(pt):
-            v = (pt[0]-start_xy[0], pt[1]-start_xy[1])
-            return dir_vec[0]*v[1] - dir_vec[1]*v[0]
+    # 判断左右
+    dir_vec = (end_xy[0]-start_xy[0], end_xy[1]-start_xy[1])
+    def side_of_point(pt):
+        v = (pt[0]-start_xy[0], pt[1]-start_xy[1])
+        return dir_vec[0]*v[1] - dir_vec[1]*v[0]
 
-        mid1 = seg1[len(seg1)//2] if len(seg1) > 1 else seg1[0]
-        if side_of_point(mid1) > 0:
-            left_seg_raw, right_seg_raw = seg1, seg2
-        else:
-            left_seg_raw, right_seg_raw = seg2, seg1
+    midA = segA[len(segA)//2]
+    if side_of_point(midA) > 0:
+        left_seg_raw, right_seg_raw = segA, segB
+    else:
+        left_seg_raw, right_seg_raw = segB, segA
 
-        # 简化路径（每隔2米保留一个拐点）
-        def simplify_path(pts, tol=2.0):
-            if len(pts) <= 2:
-                return pts
-            res = [pts[0]]
-            for i in range(1, len(pts)-1):
-                if math.hypot(pts[i][0]-res[-1][0], pts[i][1]-res[-1][1]) >= tol:
-                    res.append(pts[i])
-            res.append(pts[-1])
-            return res
+    # 简化路径（保留明显拐点）
+    def simplify_path(pts, tol=3.0):
+        if len(pts) <= 2:
+            return pts
+        res = [pts[0]]
+        for i in range(1, len(pts)-1):
+            if math.hypot(pts[i][0]-res[-1][0], pts[i][1]-res[-1][1]) >= tol:
+                res.append(pts[i])
+        res.append(pts[-1])
+        return res
 
-        left_seg = simplify_path(left_seg_raw, 2.0)
-        right_seg = simplify_path(right_seg_raw, 2.0)
+    left_seg = simplify_path(left_seg_raw)
+    right_seg = simplify_path(right_seg_raw)
 
-        # 关键修复：将 Shapely Point 对象转为元组 (x, y)
-        entry_pt = (p_entry.x, p_entry.y)
-        exit_pt = (p_exit.x, p_exit.y)
+    # 入口点和出口点（转为元组）
+    entry_pt = (p1.x, p1.y)
+    exit_pt = (p2.x, p2.y)
 
-        left_path_xy = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
-        right_path_xy = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
+    left_path_xy = [start_xy, entry_pt] + left_seg[1:-1] + [exit_pt, end_xy]
+    right_path_xy = [start_xy, entry_pt] + right_seg[1:-1] + [exit_pt, end_xy]
 
-        def xy_to_latlon_list(xy_list):
-            res = []
-            for x, y in xy_list:
-                lon, lat = xy_to_lonlat(x, y, center_lon, center_lat)
-                res.append((lat, lon))
-            return res
+    def xy_to_latlon_list(xy_list):
+        res = []
+        for x, y in xy_list:
+            lon, lat = xy_to_lonlat(x, y, center_lon, center_lat)
+            res.append((lat, lon))
+        return res
 
-        left_paths.append(xy_to_latlon_list(left_path_xy))
-        right_paths.append(xy_to_latlon_list(right_path_xy))
-
-    final_left = left_paths[0] if left_paths else []
-    final_right = right_paths[0] if right_paths else []
+    left_path = xy_to_latlon_list(left_path_xy)
+    right_path = xy_to_latlon_list(right_path_xy)
 
     # 计算路径长度
     def path_len(waypoints):
@@ -255,15 +261,11 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
                              waypoints[i+1][0], waypoints[i+1][1])
                    for i in range(len(waypoints)-1))
 
-    shortest = final_left if path_len(final_left) < path_len(final_right) else final_right
+    shortest = left_path if path_len(left_path) < path_len(right_path) else right_path
 
-    return {
-        "left": final_left,
-        "right": final_right,
-        "shortest": shortest
-    }
+    return {"left": left_path, "right": right_path, "shortest": shortest}
 
-# ==================== 左侧布局 ====================
+# ==================== 左侧面板（不变） ====================
 col_left, col_right = st.columns([1, 3])
 
 with col_left:
@@ -330,7 +332,7 @@ with col_left:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ==================== 右侧布局 ====================
+# ==================== 右侧布局（航线规划 + 飞行监控） ====================
 with col_right:
     st.markdown("# 🎓 南京科技职业学院")
     st.markdown("## 无人机航线导航与监控系统")
@@ -375,26 +377,26 @@ with col_right:
                 attr="© 高德", name="高德地图", max_zoom=20
             ).add_to(m)
 
-        # 原始航线（红色虚线）
+        # 原始航线
         folium.PolyLine(
             locations=[[latA, lngA], [latB, lngB]],
             color="red", weight=2, opacity=0.6, dash_array="5,5", popup="原始直飞航线"
         ).add_to(m)
 
-        # 向左绕飞（蓝色）
+        # 左绕（蓝）
         if left_pts:
-            folium.PolyLine(locations=left_pts, color="blue", weight=3, opacity=0.8,
-                            popup="向左绕飞路径（安全）").add_to(m)
+            folium.PolyLine(locations=left_pts, color="blue", weight=3, opacity=0.9,
+                            popup="左绕弧线路径").add_to(m)
 
-        # 向右绕飞（绿色）
+        # 右绕（绿）
         if right_pts:
-            folium.PolyLine(locations=right_pts, color="green", weight=3, opacity=0.8,
-                            popup="向右绕飞路径（安全）").add_to(m)
+            folium.PolyLine(locations=right_pts, color="green", weight=3, opacity=0.9,
+                            popup="右绕弧线路径").add_to(m)
 
-        # 最短路径（橙色）
+        # 最短（橙）
         if shortest_pts:
             folium.PolyLine(locations=shortest_pts, color="orange", weight=5, opacity=0.9,
-                            popup="最短绕飞路径（推荐）").add_to(m)
+                            popup="最短弧线路径（推荐）").add_to(m)
 
         folium.Marker([latA, lngA], popup="起点A", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
         folium.Marker([latB, lngB], popup="终点B", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
@@ -405,7 +407,6 @@ with col_right:
             folium.Polygon(locations=ps, color="red", fill=True, fill_opacity=0.5,
                            popup=f"{ob['name']} ({ob['height']}m)").add_to(m)
 
-        # 临时打点
         if len(st.session_state.draw_points) >= 2:
             ps = [[lat, lng] for (lng, lat) in st.session_state.draw_points]
             folium.Polygon(locations=ps, color="blue", fill=True, fill_opacity=0.2).add_to(m)
@@ -439,9 +440,6 @@ with col_right:
                     st.session_state.flight_status = "idle"
                     save_state()
                     st.success("航线已设置，请切换到“飞行监控”。")
-            with col_btn2:
-                # 可拓展选左/右
-                pass
         else:
             if st.button("🛩️ 使用直飞航线", use_container_width=True):
                 st.session_state.waypoints = [[latA, lngA], [latB, lngB]]
@@ -453,7 +451,6 @@ with col_right:
         # ==================== 飞行监控页面 ====================
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
 
-        # 通信链路
         st.markdown("### 📡 通信链路拓扑与数据流")
         link_cols = st.columns(4)
         with link_cols[0]:
@@ -467,7 +464,6 @@ with col_right:
         if not waypoints:
             st.warning("⚠️ 尚未设置航线，请先在“航线规划”页面计算并应用航线。")
         else:
-            # 控制按钮
             if st.session_state.flight_status == "idle":
                 col1, col2 = st.columns(2)
                 with col1:
@@ -508,7 +504,6 @@ with col_right:
                 with col3:
                     st.button("⏸️ 暂停任务", disabled=True, use_container_width=True)
 
-            # 飞行动态计算
             if st.session_state.flight_status in ("running", "paused"):
                 wp_list = waypoints
                 total_dist = 0.0
@@ -528,7 +523,6 @@ with col_right:
                 flown_dist = min(elapsed * st.session_state.flight_speed, total_dist)
                 remaining_dist = total_dist - flown_dist
 
-                # 当前位置
                 if total_dist == 0:
                     cur_lat, cur_lon = wp_list[0]
                     seg_idx = 0
@@ -552,19 +546,13 @@ with col_right:
                 wp_total = len(wp_list) - 1
                 wp_display = f"{min(seg_idx+1, wp_total)}/{wp_total}"
 
-                if st.session_state.flight_speed > 0:
-                    rem_seconds = remaining_dist / st.session_state.flight_speed
-                else:
-                    rem_seconds = 0
+                rem_seconds = remaining_dist / st.session_state.flight_speed if st.session_state.flight_speed > 0 else 0
                 eta = datetime.datetime.now() + datetime.timedelta(seconds=rem_seconds)
                 eta_str = eta.strftime("%H:%M:%S")
-
                 elapsed_td = datetime.timedelta(seconds=int(elapsed))
                 elapsed_str = str(elapsed_td)
-
                 battery = max(0.0, 100.0 - 100.0 * flown_dist / total_dist) if total_dist > 0 else 100.0
 
-                # 指标面板
                 with st.container():
                     metrics = st.columns(5)
                     metrics[0].metric("📍 当前航点", wp_display)
@@ -584,7 +572,6 @@ with col_right:
                 st.progress(min(progress, 1.0))
                 st.caption(f"任务进度：{progress*100:.1f}%")
 
-                # 实时地图
                 m2 = folium.Map(location=[cur_lat, cur_lon], zoom_start=17, control_scale=True)
                 if len(wp_list) > 1:
                     folium.PolyLine(locations=wp_list, color="orange", weight=3, popup="航线").add_to(m2)
@@ -597,7 +584,7 @@ with col_right:
                 ).add_to(m2)
                 st_folium.st_folium(m2, width=1400, height=400)
 
-        # ==================== 心跳监控区域 ====================
+        # ==================== 心跳监控 ====================
         st.markdown("---")
         st.markdown("### 💓 地面站心跳监控")
 
@@ -631,7 +618,7 @@ with col_right:
         else:
             st.info("暂无心跳数据，点击“开始心跳监测”记录。")
 
-# ==================== 实时刷新 ====================
+# ==================== 自动刷新 ====================
 if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.heartbeat_running):
     time.sleep(1)
     st.rerun()
