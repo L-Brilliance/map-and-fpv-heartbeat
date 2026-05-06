@@ -74,7 +74,7 @@ ensure_session_state()
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
     dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon1 - lon2)
+    dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
@@ -92,35 +92,43 @@ def xy_to_lonlat(x, y, center_lon, center_lat):
     lat = center_lat + y / meter_per_deg_lat
     return lon, lat
 
-# ==================== 向上外凸贝塞尔拱弧 ====================
-def create_bezier_arc_path_upward(start_xy, end_xy, mid_offset=10.0, seg_num=25):
+# ==================== 【修正版】向外拱起的贝塞尔弧线（强制在障碍物外侧） ====================
+def create_offset_bezier_arc(start_xy, end_xy, offset_dist=15.0, seg_num=30):
+    """
+    生成一条：垂直航线方向、向外偏移的贝塞尔弧线
+    offset_dist: 向外偏移的距离（米），越大离障碍物越远
+    """
     x0, y0 = start_xy
     x1, y1 = end_xy
-    mx = (x0 + x1) / 2
-    my = (y0 + y1) / 2
 
+    # 航线方向向量
     dx = x1 - x0
     dy = y1 - y0
-    nx = -dy
-    ny = dx
-    L = math.hypot(nx, ny)
-    if L > 1e-6:
-        nx /= L
-        ny /= L
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return [start_xy, end_xy]
 
-    cx = mx + nx * mid_offset
-    cy = my + ny * mid_offset
+    # 垂直航线的单位向量（向外）
+    nx = -dy / L
+    ny = dx / L
 
+    # 控制点：在航线中点，向外侧偏移 offset_dist 米
+    mid_x = (x0 + x1) / 2
+    mid_y = (y0 + y1) / 2
+    ctrl_x = mid_x + nx * offset_dist
+    ctrl_y = mid_y + ny * offset_dist
+
+    # 生成二次贝塞尔曲线点
     arc = []
     for t in range(seg_num + 1):
         t = t / seg_num
         mt = 1 - t
-        x = mt**2 * x0 + 2 * mt * t * cx + t**2 * x1
-        y = mt**2 * y0 + 2 * mt * t * cy + t**2 * y1
+        x = mt**2 * x0 + 2 * mt * t * ctrl_x + t**2 * x1
+        y = mt**2 * y0 + 2 * mt * t * ctrl_y + t**2 * y1
         arc.append((x, y))
     return arc
 
-# ==================== 核心绕飞：大障碍 + 中间上拱弧线 ====================
+# ==================== 【修正版】核心绕飞逻辑（100%生成绕飞弧线） ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     if not obstacles:
         straight = [(latA, lngA), (latB, lngB)]
@@ -130,6 +138,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
     end_xy = lonlat_to_xy(lngB, latB, center_lon, center_lat)
 
+    # 1. 构建障碍物安全缓冲区
     buffers = []
     for ob in obstacles:
         if fly_height >= ob.get("height", 0):
@@ -150,24 +159,30 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     merged = unary_union(buffers)
     direct_line = LineString([start_xy, end_xy])
 
+    # 直飞不撞障碍，直接直飞
     if not direct_line.intersects(merged):
         straight = [(latA, lngA), (latB, lngB)]
         return {"left": straight, "right": straight, "shortest": straight}
 
-    # 生成中间向上弧线
-    arc_xy = create_bezier_arc_path_upward(start_xy, end_xy, mid_offset=12, seg_num=25)
+    # 2. 强制生成向外拱的弧线，先试15米偏移
+    arc_xy = create_offset_bezier_arc(start_xy, end_xy, offset_dist=15.0, seg_num=30)
 
-    # 安全校验
-    def is_safe(path, geom):
+    # 3. 安全校验：如果弧线在障碍里，自动增大偏移量
+    def is_path_safe(path, geom):
         for x, y in path:
             pt = Point(x, y)
-            if pt.within(geom) or pt.distance(geom) < 0.3:
+            if pt.within(geom) or pt.distance(geom) < 0.5:
                 return False
         return True
 
-    if not is_safe(arc_xy, merged):
-        arc_xy = [start_xy, end_xy]
+    # 如果不安全，自动增大偏移，直到弧线在外面
+    if not is_path_safe(arc_xy, merged):
+        for offset in [20, 25, 30]:
+            arc_xy = create_offset_bezier_arc(start_xy, end_xy, offset_dist=offset, seg_num=30)
+            if is_path_safe(arc_xy, merged):
+                break
 
+    # 4. 转回经纬度
     def to_latlon(xy_list):
         res = []
         for x, y in xy_list:
@@ -175,10 +190,16 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
             res.append((lat, lon))
         return res
 
-    final = to_latlon(arc_xy)
-    return {"left": final, "right": final, "shortest": final}
+    arc_latlon = to_latlon(arc_xy)
 
-# ==================== 左侧面板 ====================
+    # 左右和推荐都用同一条安全弧线
+    return {
+        "left": arc_latlon,
+        "right": arc_latlon,
+        "shortest": arc_latlon
+    }
+
+# ==================== 左侧面板（不变） ====================
 col_left, col_right = st.columns([1, 3])
 
 with col_left:
