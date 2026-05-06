@@ -1,4 +1,4 @@
-streamlit as st
+import streamlit as st
 import streamlit_folium as st_folium
 import folium
 from folium import TileLayer
@@ -8,20 +8,19 @@ import datetime
 import json
 import os
 import math
-from shapely.geometry import Polygon, LineString
+from shapely.geometry import Polygon, LineString, Point, MultiPoint
 from shapely.ops import unary_union
 
 # ==================== 页面配置 ====================
 st.set_page_config(page_title="南京科技职业学院 - 无人机导航系统", layout="wide")
 
-# ==================== 样式 ====================
 st.markdown("""
 <style>
 .left-panel {background:#f8f9fa; padding:20px; border-radius:10px; height:95vh;}
 </style>
 """, unsafe_allow_html=True)
 
-# ==================== 持久化文件 ====================
+# ==================== 持久化 ====================
 STATE_FILE = "ground_station_state.json"
 
 def save_state():
@@ -31,169 +30,155 @@ def save_state():
         "home_point": st.session_state.home_point,
         "waypoints": st.session_state.waypoints,
         "click_mode": st.session_state.click_mode,
-        "latA": st.session_state.latA,
-        "lngA": st.session_state.lngA,
-        "latB": st.session_state.latB,
-        "lngB": st.session_state.lngB,
-        "heartbeat_data": st.session_state.heartbeat_data[-100:],
-        "seq": st.session_state.seq,
-        "running": st.session_state.running
+        "latA": st.session_state.latA, "lngA": st.session_state.lngA,
+        "latB": st.session_state.latB, "lngB": st.session_state.lngB,
+        "heartbeat_data": st.session_state.heartbeat_data[-200:],
+        "heartbeat_seq": st.session_state.heartbeat_seq,
+        "heartbeat_running": st.session_state.heartbeat_running,
+        "flight_status": st.session_state.flight_status,
+        "flight_start_time": st.session_state.flight_start_time.isoformat() if st.session_state.flight_start_time else None,
+        "flight_paused_duration": st.session_state.flight_paused_duration,
+        "flight_speed": st.session_state.flight_speed,
+        "safety_radius": st.session_state.safety_radius,
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+        if data.get("flight_start_time"):
+            data["flight_start_time"] = datetime.datetime.fromisoformat(data["flight_start_time"])
+        return data
     return {}
 
-# ==================== 强健的 session_state 初始化 ====================
 def ensure_session_state():
     defaults = {
-        "obstacles": [],
-        "draw_points": [],
-        "home_point": [32.2335, 118.7475],
-        "waypoints": [],
-        "last_click": None,
-        "click_mode": "障碍物圈选",
-        "latA": 32.233500,
-        "lngA": 118.747500,
-        "latB": 32.233800,
-        "lngB": 118.747900,
-        "heartbeat_data": [],
-        "seq": 0,
-        "running": False,
+        "obstacles": [], "draw_points": [], "home_point": [32.2335, 118.7475], "waypoints": [],
+        "last_click": None, "click_mode": "障碍物圈选",
+        "latA": 32.233500, "lngA": 118.747500, "latB": 32.233800, "lngB": 118.747900,
+        "heartbeat_data": [], "heartbeat_seq": 0, "heartbeat_running": False,
+        "seq": 0, "running": False,
+        "flight_status": "idle", "flight_start_time": None, "flight_paused_duration": 0.0,
+        "flight_speed": 8.5, "safety_radius": 5.0,
     }
     loaded = load_state()
-    for key, default_value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = loaded.get(key, default_value)
-    if "init" not in st.session_state:
-        st.session_state.init = True
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = loaded.get(k, v)
 
 ensure_session_state()
 
-# ==================== 绕飞路径计算（支持左绕、右绕、真正的弧线最短路径） ====================
-def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, turn_radius=0.0002):
-    start = (lngA, latA)
-    end = (lngB, latB)
-    line = LineString([start, end])
+# ==================== 坐标工具 ====================
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon1 - lon2)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-    blocking = []
+def lonlat_to_xy(lon, lat, center_lon, center_lat):
+    meter_per_deg_lat = 111320.0
+    meter_per_deg_lon = 111320.0 * math.cos(math.radians(center_lat))
+    x = (lon - center_lon) * meter_per_deg_lon
+    y = (lat - center_lat) * meter_per_deg_lat
+    return x, y
+
+def xy_to_lonlat(x, y, center_lon, center_lat):
+    meter_per_deg_lat = 111320.0
+    meter_per_deg_lon = 111320.0 * math.cos(math.radians(center_lat))
+    lon = center_lon + x / meter_per_deg_lon
+    lat = center_lat + y / meter_per_deg_lat
+    return lon, lat
+
+# ==================== 向上外凸贝塞尔拱弧 ====================
+def create_bezier_arc_path_upward(start_xy, end_xy, mid_offset=10.0, seg_num=25):
+    x0, y0 = start_xy
+    x1, y1 = end_xy
+    mx = (x0 + x1) / 2
+    my = (y0 + y1) / 2
+
+    dx = x1 - x0
+    dy = y1 - y0
+    nx = -dy
+    ny = dx
+    L = math.hypot(nx, ny)
+    if L > 1e-6:
+        nx /= L
+        ny /= L
+
+    cx = mx + nx * mid_offset
+    cy = my + ny * mid_offset
+
+    arc = []
+    for t in range(seg_num + 1):
+        t = t / seg_num
+        mt = 1 - t
+        x = mt**2 * x0 + 2 * mt * t * cx + t**2 * x1
+        y = mt**2 * y0 + 2 * mt * t * cy + t**2 * y1
+        arc.append((x, y))
+    return arc
+
+# ==================== 核心绕飞：大障碍 + 中间上拱弧线 ====================
+def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
+    if not obstacles:
+        straight = [(latA, lngA), (latB, lngB)]
+        return {"left": straight, "right": straight, "shortest": straight}
+
+    center_lon, center_lat = lngA, latA
+    start_xy = lonlat_to_xy(lngA, latA, center_lon, center_lat)
+    end_xy = lonlat_to_xy(lngB, latB, center_lon, center_lat)
+
+    buffers = []
     for ob in obstacles:
-        ob_height = ob.get("height", 0)
-        if fly_height >= ob_height:
+        if fly_height >= ob.get("height", 0):
             continue
         pts = ob["points"]
         if len(pts) < 3:
             continue
-        coords = pts.copy()
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-        poly = Polygon(coords)
-        if line.intersects(poly):
-            blocking.append((poly, ob_height))
+        xy_pts = [lonlat_to_xy(p[0], p[1], center_lon, center_lat) for p in pts]
+        if xy_pts[0] != xy_pts[-1]:
+            xy_pts.append(xy_pts[0])
+        poly = Polygon(xy_pts)
+        buffers.append(poly.buffer(safety_radius_m))
 
-    if not blocking:
-        return {"left": [], "right": [], "shortest": []}
+    if not buffers:
+        straight = [(latA, lngA), (latB, lngB)]
+        return {"left": straight, "right": straight, "shortest": straight}
 
-    merged = unary_union([b[0] for b in blocking])
-    polys = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+    merged = unary_union(buffers)
+    direct_line = LineString([start_xy, end_xy])
 
-    def side_points(poly):
-        dx = end[0] - start[0]
-        dy = end[1] - start[1]
-        left_pts, right_pts = [], []
-        for (x, y) in poly.exterior.coords:
-            vx, vy = x - start[0], y - start[1]
-            cross = dx * vy - dy * vx
-            if cross > 1e-9:
-                left_pts.append((cross, (x, y)))
-            elif cross < -1e-9:
-                right_pts.append((-cross, (x, y)))
-        best_left = max(left_pts, key=lambda t: t[0])[1] if left_pts else None
-        best_right = max(right_pts, key=lambda t: t[0])[1] if right_pts else None
-        return best_left, best_right
+    if not direct_line.intersects(merged):
+        straight = [(latA, lngA), (latB, lngB)]
+        return {"left": straight, "right": straight, "shortest": straight}
 
-    left_c, right_c = [], []
-    for p in polys:
-        l, r = side_points(p)
-        if l: left_c.append(l)
-        if r: right_c.append(r)
+    # 生成中间向上弧线
+    arc_xy = create_bezier_arc_path_upward(start_xy, end_xy, mid_offset=12, seg_num=25)
 
-    def dist(p):
-        return math.hypot(p[0]-start[0], p[1]-start[1])
+    # 安全校验
+    def is_safe(path, geom):
+        for x, y in path:
+            pt = Point(x, y)
+            if pt.within(geom) or pt.distance(geom) < 0.3:
+                return False
+        return True
 
-    left_c.sort(key=dist)
-    right_c.sort(key=dist)
+    if not is_safe(arc_xy, merged):
+        arc_xy = [start_xy, end_xy]
 
-    left_path = None
-    if left_c:
-        left_path = [start] + left_c + [end]
-    right_path = None
-    if right_c:
-        right_path = [start] + right_c + [end]
+    def to_latlon(xy_list):
+        res = []
+        for x, y in xy_list:
+            lon, lat = xy_to_lonlat(x, y, center_lon, center_lat)
+            res.append((lat, lon))
+        return res
 
-    # 生成平滑弧线路径（基于二次贝塞尔曲线，真正的弧线）
-    def create_bezier_arc_path(path_pts, control_scale=0.5):
-        if not path_pts or len(path_pts) < 3:
-            return []
-        arc_path = []
-        # 起点
-        arc_path.append(path_pts[0])
-        # 对每一段路径生成弧线
-        for i in range(1, len(path_pts)-1):
-            p0 = path_pts[i-1]
-            p1 = path_pts[i]
-            p2 = path_pts[i+1]
-            
-            # 计算控制点
-            dx1 = p1[0] - p0[0]
-            dy1 = p1[1] - p0[1]
-            dx2 = p2[0] - p1[0]
-            dy2 = p2[1] - p1[1]
-            
-            # 控制点取在角平分线上，生成平滑过渡
-            control_x = p1[0] - (dx1 + dx2) * control_scale
-            control_y = p1[1] - (dy1 + dy2) * control_scale
-            
-            # 生成贝塞尔曲线点
-            steps = 10
-            for t in range(1, steps+1):
-                t = t / steps
-                # 二次贝塞尔公式
-                x = (1-t)**2 * p0[0] + 2*(1-t)*t * control_x + t**2 * p2[0]
-                y = (1-t)**2 * p0[1] + 2*(1-t)*t * control_y + t**2 * p2[1]
-                arc_path.append((x, y))
-        # 终点
-        arc_path.append(path_pts[-1])
-        return arc_path
+    final = to_latlon(arc_xy)
+    return {"left": final, "right": final, "shortest": final}
 
-    left_arc = create_bezier_arc_path(left_path) if left_path else []
-    right_arc = create_bezier_arc_path(right_path) if right_path else []
-
-    # 选择最短路径
-    def path_len(p):
-        if not p:
-            return float('inf')
-        return sum(math.hypot(p[i+1][0]-p[i][0], p[i+1][1]-p[i][1]) for i in range(len(p)-1))
-
-    len_l = path_len(left_arc)
-    len_r = path_len(right_arc)
-    shortest_path = left_arc if len_l < len_r else right_arc
-
-    # 转为 (lat, lng) 格式
-    def to_lat_lng(points):
-        return [(p[1], p[0]) for p in points] if points else []
-
-    return {
-        "left": to_lat_lng(left_path) if left_path else [],
-        "right": to_lat_lng(right_path) if right_path else [],
-        "shortest": to_lat_lng(shortest_path) if shortest_path else []
-    }
-
-# ==================== 左侧布局 ====================
+# ==================== 左侧面板 ====================
 col_left, col_right = st.columns([1, 3])
 
 with col_left:
@@ -203,46 +188,37 @@ with col_left:
     st.divider()
 
     if page == "航线规划":
-        # 地图点击模式选择
-        st.markdown("### 🖱️ 地图点击用途")
-        click_mode = st.radio(
-            "点击地图时",
-            ["障碍物圈选", "选择终点"],
-            horizontal=True,
-            index=0 if st.session_state.click_mode == "障碍物圈选" else 1
-        )
+        click_mode = st.radio("点击地图时", ["障碍物圈选", "选择终点"], horizontal=True,
+                              index=0 if st.session_state.click_mode == "障碍物圈选" else 1)
         if click_mode != st.session_state.click_mode:
             st.session_state.click_mode = click_mode
             save_state()
 
         st.divider()
+        st.markdown("### 🛡️ 安全设置")
+        safety_radius = st.slider("安全距离 (米)", 1.0, 30.0, st.session_state.safety_radius, 0.5)
+        if safety_radius != st.session_state.safety_radius:
+            st.session_state.safety_radius = safety_radius
+            save_state()
 
-        # 障碍物圈选
-        st.markdown("### 🚧 障碍物圈选（永久记忆）")
+        st.divider()
+        st.markdown("### 🚧 障碍物圈选")
         name = st.text_input("障碍物名称", "教学楼")
-        height = st.number_input("高度(m)", min_value=1, max_value=500, value=25, step=1)
-
+        height = st.number_input("高度(m)", 1, 500, 25)
         st.info(f"当前已打点：{len(st.session_state.draw_points)} 个")
-
         if st.button("🧹 清空当前打点", use_container_width=True):
             st.session_state.draw_points = []
             save_state()
             st.rerun()
-
         if st.button("✅ 保存障碍物", type="primary", use_container_width=True):
             if len(st.session_state.draw_points) >= 3:
-                st.session_state.obstacles.append({
-                    "name": name,
-                    "height": height,
-                    "points": st.session_state.draw_points.copy()
-                })
+                st.session_state.obstacles.append({"name": name, "height": height, "points": st.session_state.draw_points.copy()})
                 st.session_state.draw_points = []
                 save_state()
-                st.success("✅ 保存成功！永久显示！")
+                st.success("✅ 保存成功！")
                 st.rerun()
             else:
                 st.warning("⚠️ 至少需要3个点")
-
         st.divider()
         st.markdown("### 📋 已保存障碍物")
         for i, ob in enumerate(st.session_state.obstacles):
@@ -254,7 +230,6 @@ with col_left:
                     del st.session_state.obstacles[i]
                     save_state()
                     st.rerun()
-
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ==================== 右侧布局 ====================
@@ -263,7 +238,6 @@ with col_right:
     st.markdown("## 无人机航线导航与监控系统")
 
     if page == "航线规划":
-        # AB点坐标（已移除固定的key，保证与点击终点同步）
         st.markdown("### 🎯 AB点航线")
         c1, c2 = st.columns(2)
         with c1:
@@ -272,131 +246,197 @@ with col_right:
         with c2:
             latB = st.number_input("终点B纬度", value=st.session_state.latB, format="%.6f")
             lngB = st.number_input("终点B经度", value=st.session_state.lngB, format="%.6f")
+        st.session_state.latA, st.session_state.lngA = latA, lngA
+        st.session_state.latB, st.session_state.lngB = latB, lngB
 
-        # 双向同步
-        st.session_state.latA = latA
-        st.session_state.lngA = lngA
-        st.session_state.latB = latB
-        st.session_state.lngB = lngB
-
-        fly_h = st.number_input("飞行高度(m)", min_value=1, max_value=500, value=50, step=1)
+        fly_h = st.number_input("飞行高度(m)", 1, 500, 50)
         map_type = st.radio("🗺️ 地图模式", ["高德普通地图", "卫星影像地图"], horizontal=True)
 
-        # 计算三种绕飞路径
-        paths = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles)
+        paths = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles, st.session_state.safety_radius)
         left_pts = paths["left"]
         right_pts = paths["right"]
         shortest_pts = paths["shortest"]
 
-        # 构建地图
         center_lat = (latA + latB) / 2
         center_lng = (lngA + lngB) / 2
         m = folium.Map(location=[center_lat, center_lng], zoom_start=17, control_scale=True)
 
         if map_type == "卫星影像地图":
-            TileLayer(
-                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-                attr="Esri", name="卫星影像", max_zoom=20
-            ).add_to(m)
+            TileLayer(tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                      attr="Esri", name="卫星影像", max_zoom=20).add_to(m)
         else:
-            TileLayer(
-                tiles="https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
-                attr="© 高德", name="高德地图", max_zoom=20
-            ).add_to(m)
+            TileLayer(tiles="https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
+                      attr="© 高德", name="高德地图", max_zoom=20).add_to(m)
 
-        # 原始航线（红色虚线）
-        folium.PolyLine(
-            locations=[[latA, lngA], [latB, lngB]],
-            color="red", weight=2, opacity=0.6, dash_array="5,5", popup="原始直飞航线"
-        ).add_to(m)
-
-        # 向左绕飞路径（蓝色）
+        folium.PolyLine([[latA, lngA], [latB, lngB]], color="red", weight=2, opacity=0.6, dash_array="5,5", popup="原始直飞航线").add_to(m)
         if left_pts:
-            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in left_pts] + [[latB, lngB]]
-            folium.PolyLine(locations=path, color="blue", weight=3, opacity=0.8, popup="向左绕飞路径").add_to(m)
-
-        # 向右绕飞路径（绿色）
+            folium.PolyLine(left_pts, color="blue", weight=3, opacity=0.9, popup="左绕弧线路径").add_to(m)
         if right_pts:
-            path = [[latA, lngA]] + [[lat, lng] for (lat, lng) in right_pts] + [[latB, lngB]]
-            folium.PolyLine(locations=path, color="green", weight=3, opacity=0.8, popup="向右绕飞路径").add_to(m)
-
-        # 最短弧线路径（橙色，真正的弧线）
+            folium.PolyLine(right_pts, color="green", weight=3, opacity=0.9, popup="右绕弧线路径").add_to(m)
         if shortest_pts:
-            path = [[lat, lng] for (lat, lng) in shortest_pts]
-            folium.PolyLine(locations=path, color="orange", weight=5, opacity=0.9, popup="最短弧线路径（推荐）").add_to(m)
+            folium.PolyLine(shortest_pts, color="orange", weight=5, opacity=0.9, popup="最短弧线路径（推荐）").add_to(m)
 
         folium.Marker([latA, lngA], popup="起点A", icon=folium.Icon(color="green", icon="info-sign")).add_to(m)
         folium.Marker([latB, lngB], popup="终点B", icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
 
-        # 障碍物
         for ob in st.session_state.obstacles:
             ps = [[lat, lng] for (lng, lat) in ob["points"]]
-            folium.Polygon(locations=ps, color="red", fill=True, fill_opacity=0.5,
-                           popup=f"{ob['name']} ({ob['height']}m)").add_to(m)
+            folium.Polygon(ps, color="red", fill=True, fill_opacity=0.5, popup=f"{ob['name']} ({ob['height']}m)").add_to(m)
 
-        # 当前圈选临时多边形
         if len(st.session_state.draw_points) >= 2:
             ps = [[lat, lng] for (lng, lat) in st.session_state.draw_points]
-            folium.Polygon(locations=ps, color="blue", fill=True, fill_opacity=0.2).add_to(m)
+            folium.Polygon(ps, color="blue", fill=True, fill_opacity=0.2).add_to(m)
 
-        # 地图渲染
         o = st_folium.st_folium(m, width=1400, height=700, returned_objects=["last_clicked"])
-
-        # 处理点击
         if o and o.get("last_clicked"):
-            click_lat = o["last_clicked"]["lat"]
-            click_lng = o["last_clicked"]["lng"]
-            pt = (round(click_lng, 6), round(click_lat, 6))
-
+            d = o["last_clicked"]
+            pt = (round(d["lng"], 6), round(d["lat"], 6))
             if st.session_state.click_mode == "障碍物圈选":
                 if pt != st.session_state.last_click:
                     st.session_state.last_click = pt
                     st.session_state.draw_points.append(pt)
                     save_state()
                     st.rerun()
-            else:  # 选择终点模式
-                st.session_state.latB = round(click_lat, 6)
-                st.session_state.lngB = round(click_lng, 6)
+            else:
+                st.session_state.latB = round(d["lat"], 6)
+                st.session_state.lngB = round(d["lng"], 6)
                 st.session_state.last_click = pt
                 save_state()
                 st.rerun()
 
-    else:
-        # 心跳监控（带记忆）
-        st.title("📡 无人机心跳监控")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("▶️ 开始监测", use_container_width=True):
-                st.session_state.running = True
+        st.markdown("---")
+        if shortest_pts:
+            if st.button("🛩️ 使用推荐航线飞行", use_container_width=True):
+                st.session_state.waypoints = shortest_pts
+                st.session_state.flight_status = "idle"
                 save_state()
-        with c2:
-            if st.button("⏸️ 暂停监测", use_container_width=True):
-                st.session_state.running = False
+                st.success("航线已设置，请切换到“飞行监控”。")
+        else:
+            if st.button("🛩️ 使用直飞航线", use_container_width=True):
+                st.session_state.waypoints = [[latA, lngA], [latB, lngB]]
+                st.session_state.flight_status = "idle"
                 save_state()
+                st.success("直飞航线已设置。")
 
-        placeholder = st.empty()
-        while True:
-            if st.session_state.running:
-                st.session_state.seq += 1
-                t = datetime.datetime.now().strftime("%H:%M:%S")
-                st.session_state.heartbeat_data.append({
-                    "序号": st.session_state.seq,
-                    "时间": t,
-                    "状态": "正常"
-                })
-                save_state()
-                df = pd.DataFrame(st.session_state.heartbeat_data)
-                with placeholder.container():
-                    st.line_chart(df, x="时间", y="序号")
-                    st.dataframe(df, use_container_width=True)
-                time.sleep(1)
-            else:
-                if st.session_state.heartbeat_data:
-                    df = pd.DataFrame(st.session_state.heartbeat_data)
-                    with placeholder.container():
-                        st.line_chart(df, x="时间", y="序号")
-                        st.dataframe(df, use_container_width=True)
+    else:
+        st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
+        st.markdown("### 📡 通信链路拓扑与数据流")
+        cols = st.columns(4)
+        cols[0].success("🟢 GCS在线")
+        cols[1].success("🟢 OBC在线")
+        cols[2].success("🟢 FCU在线")
+
+        waypoints = st.session_state.waypoints
+        if not waypoints:
+            st.warning("⚠️ 尚未设置航线")
+        else:
+            if st.session_state.flight_status == "idle":
+                c1, c2 = st.columns(2)
+                if c1.button("▶️ 开始任务", use_container_width=True):
+                    st.session_state.flight_status = "running"
+                    st.session_state.flight_start_time = datetime.datetime.now()
+                    st.session_state.flight_paused_duration = 0.0
+                    save_state()
+                    st.rerun()
+                c2.button("⏸️ 暂停任务", disabled=True)
+            elif st.session_state.flight_status == "running":
+                c1, c2 = st.columns(2)
+                c1.button("▶️ 开始任务", disabled=True)
+                if c2.button("⏸️ 暂停任务", use_container_width=True):
+                    now = datetime.datetime.now()
+                    elapsed = (now - st.session_state.flight_start_time).total_seconds() - st.session_state.flight_paused_duration
+                    st.session_state.flight_paused_duration += elapsed
+                    st.session_state.flight_status = "paused"
+                    save_state()
+                    st.rerun()
+            elif st.session_state.flight_status == "paused":
+                c1, c2, c3 = st.columns(3)
+                if c1.button("▶️ 继续任务", use_container_width=True):
+                    st.session_state.flight_status = "running"
+                    save_state()
+                    st.rerun()
+                if c2.button("⏹️ 重置任务", use_container_width=True):
+                    st.session_state.flight_status = "idle"
+                    st.session_state.flight_start_time = None
+                    st.session_state.flight_paused_duration = 0.0
+                    save_state()
+                    st.rerun()
+                c3.button("⏸️ 暂停任务", disabled=True)
+
+            if st.session_state.flight_status in ("running", "paused"):
+                wp_list = waypoints
+                total_dist = sum(haversine(wp_list[i][0], wp_list[i][1], wp_list[i+1][0], wp_list[i+1][1]) for i in range(len(wp_list)-1))
+                if st.session_state.flight_status == "running":
+                    elapsed = (datetime.datetime.now() - st.session_state.flight_start_time).total_seconds() - st.session_state.flight_paused_duration
                 else:
-                    with placeholder.container():
-                        st.info("暂无监控数据")
-                time.sleep(0.5)
+                    elapsed = st.session_state.flight_paused_duration
+                flown = min(elapsed * st.session_state.flight_speed, total_dist)
+                remain = total_dist - flown
+
+                cum = 0
+                cur_lat, cur_lon = wp_list[0]
+                idx = 0
+                for i in range(len(wp_list)-1):
+                    d = haversine(wp_list[i][0], wp_list[i][1], wp_list[i+1][0], wp_list[i+1][1])
+                    if cum + d >= flown:
+                        idx = i
+                        prop = (flown - cum) / d if d > 0 else 0
+                        cur_lat = wp_list[i][0] + (wp_list[i+1][0] - wp_list[i][0]) * prop
+                        cur_lon = wp_list[i][1] + (wp_list[i+1][1] - wp_list[i][1]) * prop
+                        break
+                    cum += d
+                else:
+                    idx = len(wp_list)-2
+                    cur_lat, cur_lon = wp_list[-1]
+
+                wp_disp = f"{min(idx+1, len(wp_list)-1)}/{len(wp_list)-1}"
+                batt = max(0.0, 100 - 100*flown/total_dist) if total_dist > 0 else 100
+
+                cols = st.columns(5)
+                cols[0].metric("📍 当前航点", wp_disp)
+                cols[1].metric("⚡ 飞行速度", f"{st.session_state.flight_speed:.1f} m/s")
+                cols[2].metric("⏱️ 已用时间", str(datetime.timedelta(seconds=int(elapsed))))
+                cols[3].metric("🛣️ 剩余距离", f"{remain:.1f} m")
+                cols[4].metric("⏰ 预计到达", (datetime.datetime.now() + datetime.timedelta(seconds=remain/st.session_state.flight_speed)).strftime("%H:%M:%S") if st.session_state.flight_speed > 0 else "--:--:--")
+
+                st.markdown(f"<div style='background:#f3e5f5;border-radius:10px;padding:10px'><strong>🔋 电量模拟</strong> <span style='color:{'red' if batt<20 else 'green'}'>{batt:.1f}%</span></div>", unsafe_allow_html=True)
+                st.progress(min(flown/total_dist, 1.0) if total_dist > 0 else 1.0)
+                st.caption(f"任务进度：{(flown/total_dist)*100:.1f}%" if total_dist > 0 else "完成")
+
+                m2 = folium.Map(location=[cur_lat, cur_lon], zoom_start=17)
+                if len(wp_list) > 1:
+                    folium.PolyLine(wp_list, color="orange", weight=3).add_to(m2)
+                folium.Marker(wp_list[0], icon=folium.Icon(color="green")).add_to(m2)
+                folium.Marker(wp_list[-1], icon=folium.Icon(color="red")).add_to(m2)
+                folium.Marker([cur_lat, cur_lon], icon=folium.Icon(color="blue", icon="plane", prefix="fa")).add_to(m2)
+                st_folium.st_folium(m2, width=1400, height=400)
+
+        st.markdown("---")
+        st.markdown("### 💓 地面站心跳监控")
+        ch1, ch2 = st.columns(2)
+        if not st.session_state.heartbeat_running:
+            if ch1.button("▶️ 开始心跳监测", use_container_width=True):
+                st.session_state.heartbeat_running = True
+                save_state()
+                st.rerun()
+        else:
+            if ch1.button("⏸️ 停止心跳监测", use_container_width=True):
+                st.session_state.heartbeat_running = False
+                save_state()
+                st.rerun()
+
+        if st.session_state.heartbeat_running:
+            st.session_state.heartbeat_seq += 1
+            st.session_state.heartbeat_data.append({"序号": st.session_state.heartbeat_seq, "时间": datetime.datetime.now().strftime("%H:%M:%S"), "状态": "正常"})
+            save_state()
+
+        if st.session_state.heartbeat_data:
+            df = pd.DataFrame(st.session_state.heartbeat_data[-50:])
+            st.line_chart(df.set_index("时间")["序号"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("暂无心跳数据")
+
+if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.heartbeat_running):
+    time.sleep(1)
+    st.rerun()
