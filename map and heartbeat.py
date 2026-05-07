@@ -55,7 +55,7 @@ def gcj02_to_wgs84(lng:float,lat:float):
         ret+=(20.0*np.sin(y*np.pi)+40.0*np.sin(y/3.0*np.pi))*2.0/3.0
         ret+=(160.0*np.sin(y/12.0*np.pi)+320*np.sin(y/30.0*np.pi))*2.0/3.0
         return ret
-def transform_lng(x,y):
+    def transform_lng(x,y):
         ret=300.0+x+2.0*y+0.1*x*x+0.1*x*y+0.1*np.sqrt(abs(x))
         ret+=(20.0*np.sin(6.0*x*np.pi)+20.0*np.sin(2.0*x*np.pi))*2.0/3.0
         ret+=(20.0*np.sin(x*np.pi)+40.0*np.sin(x/3.0*np.pi))*2.0/3.0
@@ -362,4 +362,4 @@ else:
             st.info(f"🚧 障碍物数量：{len(st.session_state.polygon_memory)} 个")
     if st.session_state.flight_running and not st.session_state.flight_paused:
         time.sleep(0.1)
-        st.rerun()
+ 
