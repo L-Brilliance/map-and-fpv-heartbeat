@@ -72,117 +72,79 @@ for key, val in default_states.items():
 # ===================== 页面配置 =====================
 st.set_page_config(layout="wide", page_title="南科院无人机航线规划系统")
 
-# ===================== 安全绕飞算法（左右弧线） =====================
-def get_left_right_routes(pA, pB, obstacles, safe_dist):
-    """
-    返回 left_route, right_route, shortest_route
-    若无障碍物冲突，返回直线作为三条路径
-    """
+# ===================== 平滑弧线工具 =====================
+def smooth_curve(points, num=50):
+    points = np.array(points)
+    if len(points) < 2:
+        return points
+    t = np.linspace(0, 1, len(points))
+    t_smooth = np.linspace(0, 1, num)
+    x = np.interp(t_smooth, t, points[:,0])
+    y = np.interp(t_smooth, t, points[:,1])
+    return list(zip(x, y))
+
+# ===================== 高度判断 + 绕飞算法 =====================
+def get_all_routes(pA, pB, obstacles, safe_dist, flight_h):
     base_line = LineString([pA, pB])
-    # 构建所有障碍物的安全缓冲区
     buffers = []
+    need_avoid = False
+
     for obs in obstacles:
         pts = obs["pts"]
-        if len(pts) >= 3:
+        h = obs["h"]
+        if len(pts)>=3:
             poly = Polygon(pts).buffer(safe_dist)
             buffers.append(poly)
-    if not buffers:
+            if flight_h < h:
+                need_avoid = True
+
+    if not buffers or not need_avoid:
         straight = [pA, pB]
         return straight, straight, straight
 
     merged = unary_union(buffers)
-
-    # 无冲突，返回直线
     if not base_line.intersects(merged):
         straight = [pA, pB]
         return straight, straight, straight
 
-    # 获取合并缓冲区的外边界
     boundary = merged.exterior
     coords = list(boundary.coords)
-
-    # 直线与边界的交点
     intersection = boundary.intersection(base_line)
     pts = []
+
     if isinstance(intersection, Point):
         pts = [intersection]
     elif isinstance(intersection, MultiPoint):
         pts = list(intersection.geoms)
+
     if len(pts) < 2:
-        # 尝试延伸直线
-        dx = pB[0] - pA[0]
-        dy = pB[1] - pA[1]
-        ext_line = LineString([(pA[0]-dx*0.01, pA[1]-dy*0.01),
-                               (pB[0]+dx*0.01, pB[1]+dy*0.01)])
-        intersection = boundary.intersection(ext_line)
-        if isinstance(intersection, Point):
-            pts = [intersection]
-        elif isinstance(intersection, MultiPoint):
-            pts = list(intersection.geoms)
-        if len(pts) < 2:
-            # 回退到直线
-            straight = [pA, pB]
-            return straight, straight, straight
+        straight = [pA, pB]
+        return straight, straight
 
-    # 按直线方向排序交点
     pts.sort(key=lambda p: base_line.project(p))
-    entry = pts[0]
-    exit_ = pts[-1]
+    entry, exit_ = pts[0], pts[-1]
 
-    # 找到交点在边界坐标中的索引
-    def nearest_idx(point, coords):
-        best, idx = float('inf'), 0
-        for i, (x, y) in enumerate(coords):
-            d = np.hypot(x - point.x, y - point.y)
-            if d < best:
-                best, idx = d, i
-        return idx
+    def near_idx(p, cs):
+        return min(range(len(cs)), key=lambda i: np.hypot(cs[i][0]-p.x, cs[i][1]-p.y))
 
-    i_entry = nearest_idx(entry, coords)
-    i_exit = nearest_idx(exit_, coords)
+    ie, ix = near_idx(entry, coords), near_idx(exit_, coords)
+    seg1 = coords[ie:ix+1] if ie <= ix else coords[ie:] + coords[:ix+1]
+    seg2 = coords[ix:ie+1] if ix <= ie else coords[ix:] + coords[:ie+1]
 
-    # 边界拆分为两段
-    if i_entry <= i_exit:
-        seg1 = coords[i_entry:i_exit+1]
-        seg2 = coords[i_exit:] + coords[:i_entry+1]
-    else:
-        seg1 = coords[i_entry:] + coords[:i_exit+1]
-        seg2 = coords[i_exit:i_entry+1]
-
-    # 判断左右：取段中点的侧向叉积
-    dir_vec = (pB[0]-pA[0], pB[1]-pA[1])
     def cross(pt):
-        vx, vy = pt[0]-pA[0], pt[1]-pA[1]
-        return dir_vec[0]*vy - dir_vec[1]*vx
+        return (pB[0]-pA[0])*(pt[1]-pA[1]) - (pB[1]-pA[1])*(pt[0]-pA[0])
 
-    mid1 = seg1[len(seg1)//2]
-    mid2 = seg2[len(seg2)//2]
-    if cross(mid1) > cross(mid2):
-        left_seg = seg1
-        right_seg = seg2
-    else:
-        left_seg = seg2
-        right_seg = seg1
+    left = seg1 if cross(seg1[len(seg1)//2]) > 0 else seg2
+    right = seg2 if cross(seg1[len(seg1)//2]) > 0 else seg1
 
-    # 构建完整路径（用边界点，不简化）
-    entry_pt = (entry.x, entry.y)
-    exit_pt = (exit_.x, exit_.y)
+    ep = (entry.x, entry.y)
+    xp = (exit_.x, exit_.y)
 
-    left_path = [pA, entry_pt] + left_seg[1:-1] + [exit_pt, pB]
-    right_path = [pA, entry_pt] + right_seg[1:-1] + [exit_pt, pB]
+    left_route = smooth_curve([pA, ep] + left[1:-1] + [xp, pB], 80)
+    right_route = smooth_curve([pA, ep] + right[1:-1] + [xp, pB], 80)
+    shortest = left_route if len(left_route) < len(right_route) else right_route
 
-    # 计算路径长度（经纬度近似距离）
-    def path_len(pts):
-        total = 0.0
-        for i in range(len(pts)-1):
-            total += np.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
-        return total
-
-    len_left = path_len(left_path)
-    len_right = path_len(right_path)
-    shortest_path = left_path if len_left < len_right else right_path
-
-    return left_path, right_path, shortest_path
+    return left_route, right_route, shortest
 
 # ===================== 侧边栏 =====================
 with st.sidebar:
@@ -214,6 +176,8 @@ if page == "航线规划":
         a_lon = st.number_input("起点A 经度", value=st.session_state.A[1], format="%.6f")
         b_lat = st.number_input("终点B 纬度", value=st.session_state.B[0], format="%.6f")
         b_lon = st.number_input("终点B 经度", value=st.session_state.B[1], format="%.6f")
+        st.session_state.height = st.slider("飞行高度（m）", 0, 300, 50)
+
         if st.button("使用输入值更新AB点"):
             st.session_state.A = (a_lat, a_lon)
             st.session_state.B = (b_lat, b_lon)
@@ -276,20 +240,6 @@ if page == "航线规划":
                 st.error(f"⚠️ 障碍物{idx+1}({oh}m) → 高度不足，需绕飞")
             else:
                 st.success(f"✅ 障碍物{idx+1}({oh}m) → 高度安全")
-        if st.session_state.A_set and st.session_state.B_set:
-            left_route, right_route, shortest_route = get_left_right_routes(
-                st.session_state.A, st.session_state.B,
-                st.session_state.polygon_memory,
-                st.session_state.safe_radius
-            )
-            # 判断是否有绕飞
-            direct = LineString([st.session_state.A, st.session_state.B])
-            conflict = any(direct.intersects(Polygon(obs["pts"]).buffer(st.session_state.safe_radius))
-                           for obs in st.session_state.polygon_memory if len(obs["pts"])>=3)
-            if conflict:
-                st.warning("🛡️ 航线与障碍物距离不足，已生成左右绕飞弧线")
-            else:
-                st.success("🛡️ 航线与障碍物安全距离充足")
 
         st.divider()
         st.subheader("❤️ 无人机心跳监测")
@@ -317,53 +267,45 @@ if page == "航线规划":
         )
         folium.plugins.Fullscreen(position="topright").add_to(m)
 
-        # 起点/终点
         if st.session_state.A_set:
-            folium.CircleMarker(st.session_state.A, radius=12, color="red",
-                                fill=True, fill_color="red", popup="起点A").add_to(m)
+            folium.CircleMarker(st.session_state.A, radius=12, color="red", fill=True, fill_color="red", popup="起点A").add_to(m)
         if st.session_state.B_set:
-            folium.CircleMarker(st.session_state.B, radius=12, color="green",
-                                fill=True, fill_color="green", popup="终点B").add_to(m)
+            folium.CircleMarker(st.session_state.B, radius=12, color="green", fill=True, fill_color="green", popup="终点B").add_to(m)
 
-        # 障碍物及缓冲区
         for idx, obs in enumerate(st.session_state.polygon_memory):
             pts = obs["pts"]
             hh = obs["h"]
             if len(pts) >= 3:
-                folium.Polygon(pts, color="#dc2626", fill=True, fill_opacity=0.45,
-                               popup=f"障碍物{idx+1}｜高度：{hh}m").add_to(m)
+                folium.Polygon(pts, color="#dc2626", fill=True, fill_opacity=0.45, popup=f"障碍物{idx+1}｜高度：{hh}m").add_to(m)
                 poly = Polygon(pts).buffer(st.session_state.safe_radius)
-                folium.Polygon(list(poly.exterior.coords), color="#ff9900", fill=False,
-                               weight=2, dash_array="5 5", popup="安全半径缓冲区").add_to(m)
+                folium.Polygon(list(poly.exterior.coords), color="#ff9900", fill=False, weight=2, dash_array="5 5", popup="安全半径").add_to(m)
 
-        # 临时绘制点
         if st.session_state.temp_points:
             for pt in st.session_state.temp_points:
-                folium.CircleMarker(pt, radius=5, color="#ff7700", fill=True, fill_color="#ff7700").add_to(m)
+                folium.CircleMarker(pt, radius=5, color="#ff7700", fill=True).add_to(m)
             folium.PolyLine(st.session_state.temp_points, color="#ff7700", weight=3, dash_array="10 5").add_to(m)
 
-        # 航线显示
+        # ===================== 你要的四条路线全部显示 =====================
         if st.session_state.A_set and st.session_state.B_set:
-            left_route, right_route, shortest_route = get_left_right_routes(
+            left, right, up_curve = get_all_routes(
                 st.session_state.A, st.session_state.B,
                 st.session_state.polygon_memory,
-                st.session_state.safe_radius
+                st.session_state.safe_radius,
+                st.session_state.height
             )
-            # 保存所有可能路线以便监控选择
-            st.session_state.left_route = left_route
-            st.session_state.right_route = right_route
-            st.session_state.shortest_route = shortest_route
 
-            # 直飞虚线
-            folium.PolyLine([st.session_state.A, st.session_state.B], color="gray",
-                            weight=2, dash_array="5,5", popup="直飞航线（不可用）").add_to(m)
+            st.session_state.left_route = left
+            st.session_state.right_route = right
+            st.session_state.shortest_route = up_curve
 
-            # 左绕弧线（蓝色）
-            folium.PolyLine(left_route, color="blue", weight=4, popup="左绕弧线").add_to(m)
-            # 右绕弧线（红色）
-            folium.PolyLine(right_route, color="red", weight=4, popup="右绕弧线").add_to(m)
-            # 最短路径（橙色）
-            folium.PolyLine(shortest_route, color="orange", weight=5, popup="最短弧线（推荐）").add_to(m)
+            # 直飞（黑色虚线）
+            folium.PolyLine([st.session_state.A, st.session_state.B], color="black", weight=2, dash_array="4 4", popup="直飞").add_to(m)
+            # 左绕（蓝色）
+            folium.PolyLine(left, color="blue", weight=4, popup="左绕飞").add_to(m)
+            # 右绕（绿色）
+            folium.PolyLine(right, color="green", weight=4, popup="右绕飞").add_to(m)
+            # 向上最优弧线（橙色）
+            folium.PolyLine(up_curve, color="orange", weight=5, popup="向上绕飞（推荐）").add_to(m)
 
         output = st_folium(m, width=1150, height=720, key="main_map")
         if output and output.get("last_clicked"):
@@ -381,13 +323,11 @@ if page == "航线规划":
                 elif mode == "选择起点A":
                     st.session_state.A = (click_lat, click_lng)
                     st.session_state.A_set = True
-                    st.session_state.last_click_time = now
                     save_all_data()
                     st.rerun()
                 elif mode == "选择终点B":
                     st.session_state.B = (click_lat, click_lng)
                     st.session_state.B_set = True
-                    st.session_state.last_click_time = now
                     save_all_data()
                     st.rerun()
 
@@ -395,22 +335,10 @@ if page == "航线规划":
 else:
     st.title("📡 飞行实时画面 - 任务执行监控")
     st.success("✅ 无人机系统链路正常，设备在线")
-    st.subheader("监测区域：南京科技职业学院校内空域")
-
     col_btn = st.columns(4)
     with col_btn[0]:
         if st.button("🔴 开始任务", type="primary", disabled=st.session_state.flight_running):
-            # 选择将使用的航线：默认最短弧线
-            if hasattr(st.session_state, 'selected_route'):
-                route = st.session_state.selected_route
-            else:
-                route = "shortest"
-            if route == "left":
-                st.session_state.flight_waypoints = st.session_state.get("left_route", [st.session_state.A, st.session_state.B])
-            elif route == "right":
-                st.session_state.flight_waypoints = st.session_state.get("right_route", [st.session_state.A, st.session_state.B])
-            else:
-                st.session_state.flight_waypoints = st.session_state.get("shortest_route", [st.session_state.A, st.session_state.B])
+            st.session_state.flight_waypoints = st.session_state.get("shortest_route", [st.session_state.A, st.session_state.B])
             st.session_state.flight_running = True
             st.session_state.flight_paused = False
             st.session_state.flight_start_time = datetime.now()
@@ -431,88 +359,42 @@ else:
             st.session_state.flight_paused = False
             st.session_state.current_wp_idx = 0
             st.session_state.battery = 100.0
-            st.session_state.elapsed_distance = 0.0
             st.rerun()
-
-    status_text = "任务运行中" if st.session_state.flight_running and not st.session_state.flight_paused else (
-        "已暂停" if st.session_state.flight_paused else "已停止")
-    st.caption(f"状态：{status_text}")
 
     if len(st.session_state.flight_waypoints) < 2:
         st.warning("⚠️ 请先在【航线规划】页面设置A/B点并生成航线！")
     else:
-        total_dist = sum(
-            np.hypot(st.session_state.flight_waypoints[i+1][0] - st.session_state.flight_waypoints[i][0],
-                     st.session_state.flight_waypoints[i+1][1] - st.session_state.flight_waypoints[i][1])
-            for i in range(len(st.session_state.flight_waypoints)-1)
-        )
+        total_dist = sum(np.hypot(
+            st.session_state.flight_waypoints[i+1][0]-st.session_state.flight_waypoints[i][0],
+            st.session_state.flight_waypoints[i+1][1]-st.session_state.flight_waypoints[i][1]
+        ) for i in range(len(st.session_state.flight_waypoints)-1))
         st.session_state.total_distance = round(total_dist * 111000, 2)
 
         if st.session_state.flight_running and not st.session_state.flight_paused:
             if st.session_state.current_wp_idx < len(st.session_state.flight_waypoints)-1:
                 st.session_state.current_wp_idx += 0.02
                 st.session_state.battery = max(0, st.session_state.battery - 0.02)
-                st.session_state.elapsed_distance = round(
-                    st.session_state.current_wp_idx / (len(st.session_state.flight_waypoints)-1) * st.session_state.total_distance, 2
-                )
-            else:
-                st.session_state.flight_running = False
-                st.success("🎉 任务完成！已到达终点")
 
-        current_wp = int(st.session_state.current_wp_idx) + 1
+        current_wp = int(st.session_state.current_wp_idx)+1
         total_wp = len(st.session_state.flight_waypoints)
-        elapsed_dist = st.session_state.elapsed_distance
-        remain_dist = round(st.session_state.total_distance - elapsed_dist, 2)
-
-        if st.session_state.flight_start_time:
-            elapsed_time = datetime.now() - st.session_state.flight_start_time
-            elapsed_time_str = str(timedelta(seconds=int(elapsed_time.total_seconds()))).split(".")[0]
-        else:
-            elapsed_time_str = "00:00"
-
-        eta_str = str(timedelta(seconds=int(remain_dist / st.session_state.flight_speed))).split(".")[0] if remain_dist > 0 and st.session_state.flight_speed > 0 else "00:00"
-        battery = round(st.session_state.battery, 1)
-
+        remain = round(st.session_state.total_distance - st.session_state.elapsed_distance,2)
         cols = st.columns(6)
         cols[0].metric("当前航点", f"{current_wp}/{total_wp}")
-        cols[1].metric("飞行速度", f"{st.session_state.flight_speed} m/s")
-        cols[2].metric("已用时间", elapsed_time_str)
-        cols[3].metric("剩余距离", f"{remain_dist} m")
-        cols[4].metric("预计到达", eta_str)
-        cols[5].metric("电量模拟", f"{battery} %")
+        cols[1].metric("飞行速度", "8.5 m/s")
+        cols[2].metric("剩余距离", f"{remain} m")
+        cols[5].metric("电量", f"{round(st.session_state.battery,1)}%")
+        prog = st.session_state.current_wp_idx/(total_wp-1) if total_wp>1 else 0
+        st.progress(prog, text=f"进度：{round(prog*100,1)}%")
 
-        progress = min(st.session_state.current_wp_idx / (total_wp - 1), 1.0) if total_wp > 1 else 0
-        st.progress(progress, text=f"任务进度：{round(progress*100, 1)}%")
-
-        col_map_flight, col_status = st.columns([2, 1])
+        col_map_flight, col_status = st.columns([2,1])
         with col_map_flight:
-            # 修复 attribution 缺失
-            m_flight = folium.Map(
-                location=st.session_state.flight_waypoints[0],
-                zoom_start=17,
-                tiles="https://{s}.tile.openstreetmap.de/tiles/osmde/{z}/{x}/{y}.png",
-                attr="OpenStreetMap (WGS-84)"
-            )
+            m_flight = folium.Map(location=st.session_state.flight_waypoints[0], zoom_start=17, tiles="https://{s}.tile.openstreetmap.de/tiles/osmde/{z}/{x}/{y}.png", attr="OSM")
             for obs in st.session_state.polygon_memory:
                 pts = obs["pts"]
-                if len(pts) >= 3:
+                if len(pts)>=3:
                     folium.Polygon(pts, color="#dc2626", fill=True, fill_opacity=0.45).add_to(m_flight)
-            # 绘制整条航线（浅蓝）
-            folium.PolyLine(st.session_state.flight_waypoints, color="#0066ff", weight=3, opacity=0.5).add_to(m_flight)
-            flown_idx = int(st.session_state.current_wp_idx)
-            if flown_idx >= 1:
-                folium.PolyLine(st.session_state.flight_waypoints[:flown_idx+1], color="#22bb22", weight=4).add_to(m_flight)
-            if len(st.session_state.flight_waypoints) > 0:
-                drone_pos = st.session_state.flight_waypoints[min(flown_idx, len(st.session_state.flight_waypoints)-1)]
-                folium.CircleMarker(drone_pos, radius=10, color="orange", fill=True, fill_color="orange").add_to(m_flight)
+            folium.PolyLine(st.session_state.flight_waypoints, color="orange", weight=4).add_to(m_flight)
             st_folium(m_flight, width="100%", height=500, key="flight_map")
-        with col_status:
-            st.subheader("📡 通信链路拓扑与数据流")
-            st.success("✅ GCS 在线")
-            st.success("✅ OBC 在线")
-            st.success("✅ FCU 在线")
-            st.metric("飞行高度", f"{st.session_state.height} m")
-            st.metric("安全半径", f"{st.session_state.safe_radius}")
 
     if st.session_state.flight_running and not st.session_state.flight_paused:
         time.sleep(0.1)
