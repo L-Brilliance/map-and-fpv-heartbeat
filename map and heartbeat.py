@@ -8,7 +8,8 @@ import pandas as pd
 import json
 import os
 import numpy as np
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, Point, MultiPoint
+from shapely.ops import unary_union
 
 # ===================== 数据持久化 =====================
 SAVE_FILE = "drone_data.json"
@@ -21,7 +22,7 @@ def load_all_data():
         "A": [32.2322, 118.7490], "B": [32.2343, 118.7490],
         "A_set": False, "B_set": False,
         "obstacles": [], "safe_radius": 0.0002,
-        "click_mode": "障碍物圈选"
+        "click_mode": "障碍物圈选", "selected_route": "shortest"
     }
 
 def save_all_data():
@@ -32,7 +33,8 @@ def save_all_data():
         "B_set": st.session_state.B_set,
         "obstacles": st.session_state.polygon_memory,
         "safe_radius": st.session_state.safe_radius,
-        "click_mode": st.session_state.click_mode
+        "click_mode": st.session_state.click_mode,
+        "selected_route": st.session_state.selected_route
     }
     with open(SAVE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -47,7 +49,6 @@ default_states = {
     "height": 50,
     "heartbeat_data": [],
     "polygon_memory": data["obstacles"],
-    "is_drawing": False,
     "temp_points": [],
     "obs_h": 20,
     "last_click_time": 0,
@@ -61,7 +62,8 @@ default_states = {
     "battery": 100.0,
     "total_distance": 0.0,
     "elapsed_distance": 0.0,
-    "click_mode": data.get("click_mode", "障碍物圈选")
+    "click_mode": data.get("click_mode", "障碍物圈选"),
+    "selected_route": data.get("selected_route", "shortest")
 }
 for key, val in default_states.items():
     if key not in st.session_state:
@@ -70,46 +72,117 @@ for key, val in default_states.items():
 # ===================== 页面配置 =====================
 st.set_page_config(layout="wide", page_title="南科院无人机航线规划系统")
 
-# ===================== 安全绕飞算法 =====================
-def calc_route_lines(pA, pB, offset=0.0001):
-    latA, lonA = pA
-    latB, lonB = pB
-    dx = lonB - lonA
-    dy = latB - latA
-    L = np.hypot(dx, dy)
-    if L < 1e-8:
-        L = 1e-8
-    left_off_x = -dy / L * offset
-    left_off_y = dx / L * offset
-    right_off_x = dy / L * offset
-    right_off_y = -dx / L * offset
-    left = [
-        [latA, lonA],
-        [latA + left_off_y, lonA + left_off_x],
-        [latB + left_off_y, lonB + left_off_x],
-        [latB, lonB]
-    ]
-    right = [
-        [latA, lonA],
-        [latA + right_off_y, lonA + right_off_x],
-        [latB + right_off_y, lonB + right_off_x],
-        [latB, lonB]
-    ]
-    return left, right
-
-def get_safe_route(pA, pB, obstacles, safe_dist):
+# ===================== 安全绕飞算法（左右弧线） =====================
+def get_left_right_routes(pA, pB, obstacles, safe_dist):
+    """
+    返回 left_route, right_route, shortest_route
+    若无障碍物冲突，返回直线作为三条路径
+    """
     base_line = LineString([pA, pB])
-    obs_polygons = []
+    # 构建所有障碍物的安全缓冲区
+    buffers = []
     for obs in obstacles:
         pts = obs["pts"]
         if len(pts) >= 3:
             poly = Polygon(pts).buffer(safe_dist)
-            obs_polygons.append(poly)
-    conflict = any(base_line.intersects(poly) for poly in obs_polygons)
-    if not conflict:
-        return [pA, pB], False
-    left_line, _ = calc_route_lines(pA, pB, offset=safe_dist)
-    return left_line, True
+            buffers.append(poly)
+    if not buffers:
+        straight = [pA, pB]
+        return straight, straight, straight
+
+    merged = unary_union(buffers)
+
+    # 无冲突，返回直线
+    if not base_line.intersects(merged):
+        straight = [pA, pB]
+        return straight, straight, straight
+
+    # 获取合并缓冲区的外边界
+    boundary = merged.exterior
+    coords = list(boundary.coords)
+
+    # 直线与边界的交点
+    intersection = boundary.intersection(base_line)
+    pts = []
+    if isinstance(intersection, Point):
+        pts = [intersection]
+    elif isinstance(intersection, MultiPoint):
+        pts = list(intersection.geoms)
+    if len(pts) < 2:
+        # 尝试延伸直线
+        dx = pB[0] - pA[0]
+        dy = pB[1] - pA[1]
+        ext_line = LineString([(pA[0]-dx*0.01, pA[1]-dy*0.01),
+                               (pB[0]+dx*0.01, pB[1]+dy*0.01)])
+        intersection = boundary.intersection(ext_line)
+        if isinstance(intersection, Point):
+            pts = [intersection]
+        elif isinstance(intersection, MultiPoint):
+            pts = list(intersection.geoms)
+        if len(pts) < 2:
+            # 回退到直线
+            straight = [pA, pB]
+            return straight, straight, straight
+
+    # 按直线方向排序交点
+    pts.sort(key=lambda p: base_line.project(p))
+    entry = pts[0]
+    exit_ = pts[-1]
+
+    # 找到交点在边界坐标中的索引
+    def nearest_idx(point, coords):
+        best, idx = float('inf'), 0
+        for i, (x, y) in enumerate(coords):
+            d = np.hypot(x - point.x, y - point.y)
+            if d < best:
+                best, idx = d, i
+        return idx
+
+    i_entry = nearest_idx(entry, coords)
+    i_exit = nearest_idx(exit_, coords)
+
+    # 边界拆分为两段
+    if i_entry <= i_exit:
+        seg1 = coords[i_entry:i_exit+1]
+        seg2 = coords[i_exit:] + coords[:i_entry+1]
+    else:
+        seg1 = coords[i_entry:] + coords[:i_exit+1]
+        seg2 = coords[i_exit:i_entry+1]
+
+    # 判断左右：取段中点的侧向叉积
+    dir_vec = (pB[0]-pA[0], pB[1]-pA[1])
+    def cross(pt):
+        vx, vy = pt[0]-pA[0], pt[1]-pA[1]
+        return dir_vec[0]*vy - dir_vec[1]*vx
+
+    mid1 = seg1[len(seg1)//2]
+    mid2 = seg2[len(seg2)//2]
+    if cross(mid1) > cross(mid2):
+        left_seg = seg1
+        right_seg = seg2
+    else:
+        left_seg = seg2
+        right_seg = seg1
+
+    # 构建完整路径（用边界点，不简化）
+    entry_pt = (entry.x, entry.y)
+    exit_pt = (exit_.x, exit_.y)
+
+    left_path = [pA, entry_pt] + left_seg[1:-1] + [exit_pt, pB]
+    right_path = [pA, entry_pt] + right_seg[1:-1] + [exit_pt, pB]
+
+    # 计算路径长度（经纬度近似距离）
+    def path_len(pts):
+        total = 0.0
+        for i in range(len(pts)-1):
+            total += np.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1])
+        return total
+
+    len_left = path_len(left_path)
+    len_right = path_len(right_path)
+    shortest_path = left_path if len_left < len_right else right_path
+
+    return left_path, right_path, shortest_path
 
 # ===================== 侧边栏 =====================
 with st.sidebar:
@@ -137,7 +210,6 @@ if page == "航线规划":
 
     with col_ctrl:
         st.subheader("🎛️ 点位与飞行参数")
-        # 手动输入框（仍保留）
         a_lat = st.number_input("起点A 纬度", value=st.session_state.A[0], format="%.6f")
         a_lon = st.number_input("起点A 经度", value=st.session_state.A[1], format="%.6f")
         b_lat = st.number_input("终点B 纬度", value=st.session_state.B[0], format="%.6f")
@@ -152,7 +224,6 @@ if page == "航线规划":
 
         st.divider()
         st.subheader("🖱️ 地图点击用途")
-        # 点击模式选择（无冲突）
         st.session_state.click_mode = st.radio(
             "点击地图时",
             ["障碍物圈选", "选择起点A", "选择终点B"],
@@ -206,13 +277,17 @@ if page == "航线规划":
             else:
                 st.success(f"✅ 障碍物{idx+1}({oh}m) → 高度安全")
         if st.session_state.A_set and st.session_state.B_set:
-            _, conflict = get_safe_route(
+            left_route, right_route, shortest_route = get_left_right_routes(
                 st.session_state.A, st.session_state.B,
                 st.session_state.polygon_memory,
                 st.session_state.safe_radius
             )
+            # 判断是否有绕飞
+            direct = LineString([st.session_state.A, st.session_state.B])
+            conflict = any(direct.intersects(Polygon(obs["pts"]).buffer(st.session_state.safe_radius))
+                           for obs in st.session_state.polygon_memory if len(obs["pts"])>=3)
             if conflict:
-                st.warning("🛡️ 航线与障碍物距离不足，已自动生成安全绕飞路线")
+                st.warning("🛡️ 航线与障碍物距离不足，已生成左右绕飞弧线")
             else:
                 st.success("🛡️ 航线与障碍物安全距离充足")
 
@@ -242,58 +317,58 @@ if page == "航线规划":
         )
         folium.plugins.Fullscreen(position="topright").add_to(m)
 
-        # 起点/终点标记（直接使用原坐标，无转换）
+        # 起点/终点
         if st.session_state.A_set:
-            folium.CircleMarker(
-                st.session_state.A, radius=12, color="red",
-                fill=True, fill_color="red", popup="起点A"
-            ).add_to(m)
+            folium.CircleMarker(st.session_state.A, radius=12, color="red",
+                                fill=True, fill_color="red", popup="起点A").add_to(m)
         if st.session_state.B_set:
-            folium.CircleMarker(
-                st.session_state.B, radius=12, color="green",
-                fill=True, fill_color="green", popup="终点B"
-            ).add_to(m)
+            folium.CircleMarker(st.session_state.B, radius=12, color="green",
+                                fill=True, fill_color="green", popup="终点B").add_to(m)
 
         # 障碍物及缓冲区
         for idx, obs in enumerate(st.session_state.polygon_memory):
             pts = obs["pts"]
             hh = obs["h"]
             if len(pts) >= 3:
-                folium.Polygon(
-                    locations=pts, color="#dc2626", fill=True,
-                    fill_color="#dc2626", fill_opacity=0.45,
-                    popup=f"障碍物{idx+1}｜高度：{hh}m"
-                ).add_to(m)
+                folium.Polygon(pts, color="#dc2626", fill=True, fill_opacity=0.45,
+                               popup=f"障碍物{idx+1}｜高度：{hh}m").add_to(m)
                 poly = Polygon(pts).buffer(st.session_state.safe_radius)
-                folium.Polygon(
-                    locations=list(poly.exterior.coords),
-                    color="#ff9900", fill=False, weight=2,
-                    dash_array="5 5", popup="安全半径缓冲区"
-                ).add_to(m)
+                folium.Polygon(list(poly.exterior.coords), color="#ff9900", fill=False,
+                               weight=2, dash_array="5 5", popup="安全半径缓冲区").add_to(m)
 
         # 临时绘制点
-        if len(st.session_state.temp_points) > 0:
-            for point in st.session_state.temp_points:
-                folium.CircleMarker(point, radius=5, color="#ff7700", fill=True, fill_color="#ff7700").add_to(m)
+        if st.session_state.temp_points:
+            for pt in st.session_state.temp_points:
+                folium.CircleMarker(pt, radius=5, color="#ff7700", fill=True, fill_color="#ff7700").add_to(m)
             folium.PolyLine(st.session_state.temp_points, color="#ff7700", weight=3, dash_array="10 5").add_to(m)
 
-        # AB间航线显示
+        # 航线显示
         if st.session_state.A_set and st.session_state.B_set:
-            safe_waypoints, need_avoid = get_safe_route(
+            left_route, right_route, shortest_route = get_left_right_routes(
                 st.session_state.A, st.session_state.B,
                 st.session_state.polygon_memory,
                 st.session_state.safe_radius
             )
-            st.session_state.flight_waypoints = safe_waypoints
-            color = "#22bb22" if need_avoid else "#0066ff"
-            popup = "安全绕飞航线" if need_avoid else "安全直飞航线"
-            folium.PolyLine(safe_waypoints, color=color, weight=4, opacity=0.8, popup=popup).add_to(m)
+            # 保存所有可能路线以便监控选择
+            st.session_state.left_route = left_route
+            st.session_state.right_route = right_route
+            st.session_state.shortest_route = shortest_route
 
-        # 地图交互
+            # 直飞虚线
+            folium.PolyLine([st.session_state.A, st.session_state.B], color="gray",
+                            weight=2, dash_array="5,5", popup="直飞航线（不可用）").add_to(m)
+
+            # 左绕弧线（蓝色）
+            folium.PolyLine(left_route, color="blue", weight=4, popup="左绕弧线").add_to(m)
+            # 右绕弧线（红色）
+            folium.PolyLine(right_route, color="red", weight=4, popup="右绕弧线").add_to(m)
+            # 最短路径（橙色）
+            folium.PolyLine(shortest_route, color="orange", weight=5, popup="最短弧线（推荐）").add_to(m)
+
         output = st_folium(m, width=1150, height=720, key="main_map")
         if output and output.get("last_clicked"):
             now = time.time()
-            if now - st.session_state.last_click_time > 0.5:  # 去抖
+            if now - st.session_state.last_click_time > 0.5:
                 pt = output["last_clicked"]
                 click_lat, click_lng = pt["lat"], pt["lng"]
                 new_pt = [click_lat, click_lng]
@@ -325,6 +400,17 @@ else:
     col_btn = st.columns(4)
     with col_btn[0]:
         if st.button("🔴 开始任务", type="primary", disabled=st.session_state.flight_running):
+            # 选择将使用的航线：默认最短弧线
+            if hasattr(st.session_state, 'selected_route'):
+                route = st.session_state.selected_route
+            else:
+                route = "shortest"
+            if route == "left":
+                st.session_state.flight_waypoints = st.session_state.get("left_route", [st.session_state.A, st.session_state.B])
+            elif route == "right":
+                st.session_state.flight_waypoints = st.session_state.get("right_route", [st.session_state.A, st.session_state.B])
+            else:
+                st.session_state.flight_waypoints = st.session_state.get("shortest_route", [st.session_state.A, st.session_state.B])
             st.session_state.flight_running = True
             st.session_state.flight_paused = False
             st.session_state.flight_start_time = datetime.now()
@@ -348,7 +434,8 @@ else:
             st.session_state.elapsed_distance = 0.0
             st.rerun()
 
-    status_text = "任务运行中" if st.session_state.flight_running and not st.session_state.flight_paused else ("已暂停" if st.session_state.flight_paused else "已停止")
+    status_text = "任务运行中" if st.session_state.flight_running and not st.session_state.flight_paused else (
+        "已暂停" if st.session_state.flight_paused else "已停止")
     st.caption(f"状态：{status_text}")
 
     if len(st.session_state.flight_waypoints) < 2:
@@ -399,15 +486,18 @@ else:
 
         col_map_flight, col_status = st.columns([2, 1])
         with col_map_flight:
+            # 修复 attribution 缺失
             m_flight = folium.Map(
                 location=st.session_state.flight_waypoints[0],
                 zoom_start=17,
-                tiles="https://{s}.tile.openstreetmap.de/tiles/osmde/{z}/{x}/{y}.png"
+                tiles="https://{s}.tile.openstreetmap.de/tiles/osmde/{z}/{x}/{y}.png",
+                attr="OpenStreetMap (WGS-84)"
             )
             for obs in st.session_state.polygon_memory:
                 pts = obs["pts"]
                 if len(pts) >= 3:
-                    folium.Polygon(locations=pts, color="#dc2626", fill=True, fill_color="#dc2626", fill_opacity=0.45).add_to(m_flight)
+                    folium.Polygon(pts, color="#dc2626", fill=True, fill_opacity=0.45).add_to(m_flight)
+            # 绘制整条航线（浅蓝）
             folium.PolyLine(st.session_state.flight_waypoints, color="#0066ff", weight=3, opacity=0.5).add_to(m_flight)
             flown_idx = int(st.session_state.current_wp_idx)
             if flown_idx >= 1:
