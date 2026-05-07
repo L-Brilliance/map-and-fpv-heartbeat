@@ -72,45 +72,28 @@ for key, val in default_states.items():
 # ===================== 页面配置 =====================
 st.set_page_config(layout="wide", page_title="南科院无人机航线规划系统")
 
-# ===================== 平滑弧线工具 =====================
-def smooth_curve(points, num=50):
-    points = np.array(points)
-    if len(points) < 2:
-        return points
-    t = np.linspace(0, 1, len(points))
-    t_smooth = np.linspace(0, 1, num)
-    x = np.interp(t_smooth, t, points[:,0])
-    y = np.interp(t_smooth, t, points[:,1])
-    return list(zip(x, y))
-
-# ===================== 【核心修复】高度判断 + 绕飞算法 =====================
-def get_all_routes(pA, pB, obstacles, safe_dist, flight_h):
+# ===================== 路线生成算法（完全参考你的正确逻辑 + 安全半径） =====================
+def get_left_right_routes(pA, pB, obstacles, safe_dist):
     base_line = LineString([pA, pB])
     buffers = []
-    need_avoid = False
-
-    # 构建安全缓冲区 + 判断是否需要平面绕飞
+    
     for obs in obstacles:
         pts = obs["pts"]
-        h = obs["h"]
-        if len(pts)>=3:
+        if len(pts) >= 3:
             poly = Polygon(pts).buffer(safe_dist)
             buffers.append(poly)
-            if flight_h < h:
-                need_avoid = True
 
-    # 无障碍物/飞行高度足够，直接返回直线
-    if not buffers or not need_avoid:
-        straight = [pA, pB]
-        return straight, straight, straight
+    if not buffers:
+        s = [pA, pB]
+        return s, s, s
 
     merged = unary_union(buffers)
     if not base_line.intersects(merged):
-        straight = [pA, pB]
-        return straight, straight, straight
+        s = [pA, pB]
+        return s, s, s
 
-    # 1. 获取直线与障碍物缓冲区的交点
     boundary = merged.exterior
+    coords = list(boundary.coords)
     intersection = boundary.intersection(base_line)
     pts = []
 
@@ -118,84 +101,59 @@ def get_all_routes(pA, pB, obstacles, safe_dist, flight_h):
         pts = [intersection]
     elif isinstance(intersection, MultiPoint):
         pts = list(intersection.geoms)
+
     if len(pts) < 2:
-        # 交点不足时，扩展直线求交点
         dx = pB[0] - pA[0]
         dy = pB[1] - pA[1]
-        ext_line = LineString([(pA[0]-dx*0.01, pA[1]-dy*0.01), (pB[0]+dx*0.01, pB[1]+dy*0.01)])
-        intersection = boundary.intersection(ext_line)
+        ext = LineString([(pA[0]-dx*0.01, pA[1]-dy*0.01), (pB[0]+dx*0.01, pB[1]+dy*0.01)])
+        intersection = boundary.intersection(ext)
         if isinstance(intersection, MultiPoint):
             pts = list(intersection.geoms)
         if len(pts) < 2:
-            straight = [pA, pB]
-            return straight, straight, straight
+            s = [pA, pB]
+            return s, s, s
 
-    # 2. 按直线方向排序交点（进入点、离开点）
     pts.sort(key=lambda p: base_line.project(p))
-    entry_pt = pts[0]
-    exit_pt = pts[-1]
-    entry = (entry_pt.x, entry_pt.y)
-    exit_ = (exit_pt.x, exit_pt.y)
+    entry, exit_p = pts[0], pts[-1]
 
-    # 3. 拆分障碍物边界为两条路径
-    coords = list(boundary.coords)
-    def nearest_index(point, coords_list):
-        min_dist = float('inf')
-        idx = 0
-        for i, (x, y) in enumerate(coords_list):
-            dist = np.hypot(x - point.x, y - point.y)
-            if dist < min_dist:
-                min_dist = dist
-                idx = i
-        return idx
+    def near_idx(p, cs):
+        return min(range(len(cs)), key=lambda i: np.hypot(cs[i][0]-p.x, cs[i][1]-p.y))
 
-    idx_entry = nearest_index(entry_pt, coords)
-    idx_exit = nearest_index(exit_pt, coords)
+    ie = near_idx(entry, coords)
+    ix = near_idx(exit_p, coords)
 
-    # 顺时针、逆时针两条路径
-    if idx_entry <= idx_exit:
-        path1 = coords[idx_entry:idx_exit+1]
-        path2 = coords[idx_exit:] + coords[:idx_entry+1]
+    if ie <= ix:
+        seg1 = coords[ie:ix+1]
+        seg2 = coords[ix:] + coords[:ie+1]
     else:
-        path1 = coords[idx_entry:] + coords[:idx_exit+1]
-        path2 = coords[idx_exit:idx_entry+1]
+        seg1 = coords[ie:] + coords[:ix+1]
+        seg2 = coords[ix:ie+1]
 
-    # 4. 判断路径方向（左/右绕飞）
-    def cross_product(a, b, c):
-        # 计算叉积，判断点在直线哪一侧
-        return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
+    def cross(pt):
+        return (pB[0]-pA[0])*(pt[1]-pA[1]) - (pB[1]-pA[1])*(pt[0]-pA[0])
 
-    mid1 = path1[len(path1)//2]
-    mid2 = path2[len(path2)//2]
-    cp1 = cross_product(pA, pB, mid1)
-    cp2 = cross_product(pA, pB, mid2)
+    m1 = seg1[len(seg1)//2]
+    m2 = seg2[len(seg2)//2]
 
-    if cp1 > 0:
-        left_path = path1
-        right_path = path2
+    if cross(m1) > cross(m2):
+        left = seg1
+        right = seg2
     else:
-        left_path = path2
-        right_path = path1
+        left = seg2
+        right = seg1
 
-    # 5. 拼接完整路径 + 平滑处理
-    full_left = [pA, entry] + left_path[1:-1] + [exit_, pB]
-    full_right = [pA, entry] + right_path[1:-1] + [exit_, pB]
+    ep = (entry.x, entry.y)
+    xp = (exit_p.x, exit_p.y)
 
-    left_route = smooth_curve(full_left, 80)
-    right_route = smooth_curve(full_right, 80)
+    left_route = [pA, ep] + left[1:-1] + [xp, pB]
+    right_route = [pA, ep] + right[1:-1] + [xp, pB]
 
-    # 6. 选择更短的路径作为最优路线
-    def path_length(path):
-        total = 0
-        for i in range(len(path)-1):
-            total += np.hypot(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1])
-        return total
+    def length(pts):
+        return sum(np.hypot(pts[i+1][0]-pts[i][0], pts[i+1][1]-pts[i][1]) for i in range(len(pts)-1))
 
-    len_left = path_length(left_route)
-    len_right = path_length(right_route)
-    shortest_route = left_route if len_left < len_right else right_route
+    shortest = left_route if length(left_route) < length(right_route) else right_route
 
-    return left_route, right_route, shortest_route
+    return left_route, right_route, shortest
 
 # ===================== 侧边栏 =====================
 with st.sidebar:
@@ -336,27 +294,22 @@ if page == "航线规划":
                 folium.CircleMarker(pt, radius=5, color="#ff7700", fill=True).add_to(m)
             folium.PolyLine(st.session_state.temp_points, color="#ff7700", weight=3, dash_array="10 5").add_to(m)
 
-        # ===================== 四条路线全部显示 =====================
+        # ===================== 四条路线显示 =====================
         if st.session_state.A_set and st.session_state.B_set:
-            left, right, up_curve = get_all_routes(
+            left, right, up = get_left_right_routes(
                 st.session_state.A, st.session_state.B,
                 st.session_state.polygon_memory,
-                st.session_state.safe_radius,
-                st.session_state.height
+                st.session_state.safe_radius
             )
 
             st.session_state.left_route = left
             st.session_state.right_route = right
-            st.session_state.shortest_route = up_curve
+            st.session_state.shortest_route = up
 
-            # 直飞（黑色虚线）
             folium.PolyLine([st.session_state.A, st.session_state.B], color="black", weight=2, dash_array="4 4", popup="直飞").add_to(m)
-            # 左绕（蓝色）
             folium.PolyLine(left, color="blue", weight=4, popup="左绕飞").add_to(m)
-            # 右绕（绿色）
             folium.PolyLine(right, color="green", weight=4, popup="右绕飞").add_to(m)
-            # 最优弧线（橙色）
-            folium.PolyLine(up_curve, color="orange", weight=5, popup="最优绕飞路线（推荐）").add_to(m)
+            folium.PolyLine(up, color="orange", weight=5, popup="向上绕飞（推荐）").add_to(m)
 
         output = st_folium(m, width=1150, height=720, key="main_map")
         if output and output.get("last_clicked"):
