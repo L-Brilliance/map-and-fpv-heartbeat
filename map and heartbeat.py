@@ -16,12 +16,14 @@ def load_all_data():
     if os.path.exists(SAVE_FILE):
         with open(SAVE_FILE,"r",encoding="utf-8") as f:
             return json.load(f)
-    return {"A":[32.2322,118.7490],"B":[32.2343,118.7490],"A_set":False,"B_set":False,"obstacles":[]}
+    return {"A":[32.2322,118.7490],"B":[32.2343,118.7490],"A_set":False,"B_set":False,"obstacles":[],"safe_radius":0.0002,"click_mode":"障碍物圈选"}
 def save_all_data():
     data={
         "A":list(st.session_state.A),"B":list(st.session_state.B),
         "A_set":st.session_state.A_set,"B_set":st.session_state.B_set,
-        "obstacles":st.session_state.polygon_memory
+        "obstacles":st.session_state.polygon_memory,
+        "safe_radius":st.session_state.safe_radius,
+        "click_mode":st.session_state.click_mode
     }
     with open(SAVE_FILE,"w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False,indent=2)
@@ -33,10 +35,11 @@ default_states = {
     "A_set": data["A_set"], "B_set": data["B_set"],
     "height": 50, "heartbeat_data": [], "polygon_memory": data["obstacles"],
     "is_drawing": False, "temp_points": [], "obs_h": 20, "last_click_time": 0,
-    "safe_radius": 0.0002,
+    "safe_radius": data.get("safe_radius",0.0002),
     "flight_running": False, "flight_paused": False, "current_wp_idx": 0,
     "flight_speed": 8.5, "flight_start_time": None, "flight_waypoints": [],
-    "battery": 100.0, "total_distance": 0.0, "elapsed_distance": 0.0
+    "battery": 100.0, "total_distance": 0.0, "elapsed_distance": 0.0,
+    "click_mode": data.get("click_mode","障碍物圈选")
 }
 for key, val in default_states.items():
     if key not in st.session_state:
@@ -114,11 +117,15 @@ with st.sidebar:
     coord_type=st.radio("",["GCJ-02(火星坐标)","WGS-84(原始坐标)"])
     st.divider()
     st.subheader("系统点位状态")
-    st.button("✅ A点已设置" if st.session_state.A_set else "❌ A点未设置",type="primary")
-    st.button("✅ B点已设置" if st.session_state.B_set else "❌ B点未设置",type="primary")
+    col_status = st.columns(2)
+    with col_status[0]:
+        st.button("✅ A点已设置" if st.session_state.A_set else "❌ A点未设置",type="primary",key="statusA")
+    with col_status[1]:
+        st.button("✅ B点已设置" if st.session_state.B_set else "❌ B点未设置",type="primary",key="statusB")
     st.divider()
     st.subheader("🛡️ 安全半径配置")
     st.session_state.safe_radius = st.slider("航线与障碍物安全距离", 0.00005, 0.0005, value=st.session_state.safe_radius, step=0.00001, format="%.5f")
+    save_all_data()
 
 # ===================== 航线规划页面 =====================
 if page=="航线规划":
@@ -126,50 +133,57 @@ if page=="航线规划":
     col_map,col_ctrl=st.columns([3.2,1])
     with col_ctrl:
         st.subheader("🎛️ 点位与飞行参数")
+        # 手动输入框
         a_lat=st.number_input("起点A 纬度",value=st.session_state.A[0],format="%.6f")
         a_lon=st.number_input("起点A 经度",value=st.session_state.A[1],format="%.6f")
         b_lat=st.number_input("终点B 纬度",value=st.session_state.B[0],format="%.6f")
         b_lon=st.number_input("终点B 经度",value=st.session_state.B[1],format="%.6f")
-        st.session_state.height=st.slider("无人机飞行高度 (m)",0,200,value=st.session_state.height)
-        if st.button("确定设置起点A"):
+        if st.button("使用输入值更新AB点"):
             st.session_state.A=(a_lat,a_lon)
-            st.session_state.A_set=True
-            save_all_data()
-            st.success("A点坐标已永久保存！")
-        if st.button("确定设置终点B"):
             st.session_state.B=(b_lat,b_lon)
+            st.session_state.A_set=True
             st.session_state.B_set=True
             save_all_data()
-            st.success("B点坐标已永久保存！")
+            st.success("AB点已更新")
+        st.divider()
+        st.subheader("🖱️ 地图点击用途")
+        # 点击模式选择
+        st.session_state.click_mode = st.radio(
+            "点击地图时",
+            ["障碍物圈选", "选择起点A", "选择终点B"],
+            index=0 if st.session_state.click_mode=="障碍物圈选" else (1 if st.session_state.click_mode=="选择起点A" else 2)
+        )
+        save_all_data()
+
         st.divider()
         st.subheader("🚧 障碍物区域圈选（带高度）")
         st.session_state.obs_h=st.number_input("障碍物高度(m)",0,300,value=st.session_state.obs_h)
-        if st.session_state.is_drawing:
-            st.warning(f"🖱️ 正在绘制障碍物，已点击点位：{len(st.session_state.temp_points)} 个")
+        if st.session_state.click_mode=="障碍物圈选":
+            st.info(f"🖱️ 当前为障碍物圈选模式，已打点：{len(st.session_state.temp_points)} 个")
+            col_btn1, col_btn2, col_btn3 = st.columns(3)
+            with col_btn1:
+                if st.button("撤销上一点"):
+                    if st.session_state.temp_points:
+                        st.session_state.temp_points.pop()
+                        st.rerun()
+            with col_btn2:
+                if st.button("清空当前圈选"):
+                    st.session_state.temp_points=[]
+                    st.rerun()
+            with col_btn3:
+                pass
+            if st.button("✅ 完成圈选并保存障碍物"):
+                if len(st.session_state.temp_points)>=3:
+                    st.session_state.polygon_memory.append({"pts":st.session_state.temp_points.copy(),"h":st.session_state.obs_h})
+                    save_all_data()
+                    st.success(f"障碍物已保存，高度：{st.session_state.obs_h}m")
+                    st.session_state.temp_points=[]
+                    st.rerun()
+                else:
+                    st.error("至少需要圈选3个点位！")
         else:
-            st.info("点击【开始绘制障碍物】，在地图上点击圈选禁飞区")
-        btn1,btn2,btn3=st.columns(3)
-        with btn1:
-            if st.button("开始绘制"):
-                st.session_state.is_drawing=True
-                st.session_state.temp_points=[]
-        with btn2:
-            if st.button("撤销上一点"):
-                if st.session_state.temp_points:st.session_state.temp_points.pop()
-        with btn3:
-            if st.button("取消绘制"):
-                st.session_state.is_drawing=False
-                st.session_state.temp_points=[]
-        if st.button("✅ 完成圈选并保存"):
-            if len(st.session_state.temp_points)>=3:
-                st.session_state.polygon_memory.append({"pts":st.session_state.temp_points.copy(),"h":st.session_state.obs_h})
-                save_all_data()
-                st.success(f"障碍物已保存，高度：{st.session_state.obs_h}m")
-            else:
-                st.error("至少需要圈选3个点位！")
-            st.session_state.is_drawing=False
-            st.session_state.temp_points=[]
-            st.rerun()
+            # 非圈选模式隐藏障碍物操作按钮
+            st.info("切换到【障碍物圈选】模式以绘制禁飞区")
         if st.button("🗑️ 清空全部障碍物"):
             st.session_state.polygon_memory=[]
             st.session_state.temp_points=[]
@@ -234,18 +248,34 @@ if page=="航线规划":
             else:
                 folium.PolyLine(safe_waypoints,color="#0066ff",weight=4,opacity=0.8,popup="✅ 安全直飞航线").add_to(m)
         output=st_folium(m,width=1150,height=720,key="main_map_3d")
-        if st.session_state.is_drawing and output and output.get("last_clicked"):
+        # 处理地图点击
+        if output and output.get("last_clicked"):
             now = time.time()
-            if now - st.session_state.last_click_time > 0.5:
+            if now - st.session_state.last_click_time > 0.5:  # 去抖
                 pt = output["last_clicked"]
                 click_lat, click_lng = pt["lat"], pt["lng"]
                 new_pt = [click_lat, click_lng]
-                if not st.session_state.temp_points or new_pt != st.session_state.temp_points[-1]:
-                    st.session_state.temp_points.append(new_pt)
+                cmode = st.session_state.click_mode
+                if cmode == "障碍物圈选":
+                    # 添加临时点
+                    if not st.session_state.temp_points or new_pt != st.session_state.temp_points[-1]:
+                        st.session_state.temp_points.append(new_pt)
+                        st.session_state.last_click_time = now
+                        st.rerun()
+                elif cmode == "选择起点A":
+                    st.session_state.A = (click_lat, click_lng)
+                    st.session_state.A_set = True
                     st.session_state.last_click_time = now
+                    save_all_data()
+                    st.rerun()
+                elif cmode == "选择终点B":
+                    st.session_state.B = (click_lat, click_lng)
+                    st.session_state.B_set = True
+                    st.session_state.last_click_time = now
+                    save_all_data()
                     st.rerun()
 
-# ===================== 飞行监控页面 =====================
+# ===================== 飞行监控页面（保持不变） =====================
 else:
     st.title("📡 飞行实时画面 - 任务执行监控")
     st.success("✅ 无人机系统链路正常，设备在线")
@@ -362,4 +392,3 @@ else:
             st.info(f"🚧 障碍物数量：{len(st.session_state.polygon_memory)} 个")
     if st.session_state.flight_running and not st.session_state.flight_paused:
         time.sleep(0.1)
- 
