@@ -1,5 +1,7 @@
-streamlit>=1.25
-streamlit-folium>=0.15
+streamlit
 folium
+streamlit-folium
+streamlit-option-menu
 pandas
-shapely>=2.0
+numpy
+shapely
