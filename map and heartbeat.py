@@ -91,18 +91,16 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-# ==================== 绕飞算法（左右+上绕） ====================
+# ==================== 绕飞算法（修复 MultiPolygon 错误） ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     start = (lngA, latA)
     end = (lngB, latB)
     line = LineString([start, end])
-    # 角度转换用于缓冲区
     avg_lat = (latA + latB) / 2.0
     meter_per_deg_lat = 111320.0
     meter_per_deg_lon = 111320.0 * math.cos(math.radians(avg_lat))
     buffer_deg = safety_radius_m / ((meter_per_deg_lat + meter_per_deg_lon) / 2.0)
 
-    # 收集冲突缓冲区
     blocking = []
     for ob in obstacles:
         if fly_height >= ob.get("height", 0):
@@ -119,18 +117,23 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
             blocking.append(poly_buff)
 
     if not blocking:
-        # 无冲突，返回直线作为所有路径
         straight = [start, end]
-        return {
-            "left": straight, "right": straight,
-            "shortest": straight, "over": straight
-        }
+        return {"left": straight, "right": straight, "shortest": straight, "over": straight}
 
     merged = unary_union(blocking)
-    boundary = merged.exterior
-    coords = list(boundary.coords)
+    # 处理 MultiPolygon 或非 Polygon 情况
+    if merged.geom_type == 'Polygon':
+        boundary = merged.exterior
+    elif merged.geom_type == 'MultiPolygon':
+        boundary = merged.convex_hull.exterior
+    else:
+        boundary = merged.boundary
 
-    # 交点计算
+    coords = list(boundary.coords)
+    if len(coords) < 4:
+        straight = [start, end]
+        return {"left": straight, "right": straight, "shortest": straight, "over": straight}
+
     intersection = boundary.intersection(line)
     pts = []
     if isinstance(intersection, Point):
@@ -138,7 +141,6 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     elif isinstance(intersection, MultiPoint):
         pts = list(intersection.geoms)
     if len(pts) < 2:
-        # 延伸直线尝试
         dx = end[0] - start[0]
         dy = end[1] - start[1]
         ext_line = LineString([
@@ -169,7 +171,6 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     i_entry = nearest_idx(entry, coords)
     i_exit = nearest_idx(exit_, coords)
 
-    # 拆分为两个弧段
     if i_entry <= i_exit:
         arc1 = coords[i_entry:i_exit+1]
         arc2 = coords[i_exit:] + coords[:i_entry+1]
@@ -177,7 +178,6 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         arc1 = coords[i_entry:] + coords[:i_exit+1]
         arc2 = coords[i_exit:i_entry+1]
 
-    # 左右判别（使用弧段多点的平均叉积）
     dir_vec = (end[0] - start[0], end[1] - start[1])
     def cross_z(pt):
         vx, vy = pt[0] - start[0], pt[1] - start[1]
@@ -195,19 +195,20 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     entry_pt = (entry.x, entry.y)
     exit_pt = (exit_.x, exit_.y)
 
-    # 确保弧段方向与入口→出口一致，否则反转
-    def ensure_direction(boundary_seg, entry_idx, exit_idx, entry_pt, exit_pt):
-        # 找到 entry_pt 在 seg 中最接近的位置
-        best_entry_idx = min(range(len(boundary_seg)), key=lambda i: math.hypot(boundary_seg[i][0]-entry_pt[0], boundary_seg[i][1]-entry_pt[1]))
-        best_exit_idx = min(range(len(boundary_seg)), key=lambda i: math.hypot(boundary_seg[i][0]-exit_pt[0], boundary_seg[i][1]-exit_pt[1]))
+    def ensure_direction(boundary_seg, entry_pt, exit_pt):
+        best_entry_idx = min(range(len(boundary_seg)),
+                             key=lambda i: math.hypot(boundary_seg[i][0]-entry_pt[0],
+                                                      boundary_seg[i][1]-entry_pt[1]))
+        best_exit_idx = min(range(len(boundary_seg)),
+                            key=lambda i: math.hypot(boundary_seg[i][0]-exit_pt[0],
+                                                     boundary_seg[i][1]-exit_pt[1]))
         if best_entry_idx > best_exit_idx:
             return boundary_seg[::-1]
         return boundary_seg
 
-    left_boundary = ensure_direction(left_boundary, i_entry, i_exit, entry_pt, exit_pt)
-    right_boundary = ensure_direction(right_boundary, i_entry, i_exit, entry_pt, exit_pt)
+    left_boundary = ensure_direction(left_boundary, entry_pt, exit_pt)
+    right_boundary = ensure_direction(right_boundary, entry_pt, exit_pt)
 
-    # 均匀采样中间点（至少3个，保持路径转折自然）
     def sample_boundary(pts, min_pts=3):
         if len(pts) <= min_pts + 2:
             return pts[1:-1]
@@ -220,18 +221,15 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
     left_mid = sample_boundary(left_boundary, 3)
     right_mid = sample_boundary(right_boundary, 3)
 
-    # 构建路径（不含重复的起终点，外部绘制时不再添加）
     left_path = [entry_pt] + left_mid + [exit_pt]
     right_path = [entry_pt] + right_mid + [exit_pt]
 
-    # 转换为 (lat, lng)
     def to_lat_lng(points):
         return [(p[1], p[0]) for p in points]
 
     left_latlon = to_lat_lng(left_path)
     right_latlon = to_lat_lng(right_path)
 
-    # 计算长度（度数距离）
     def path_len(pts):
         if not pts:
             return float('inf')
@@ -239,8 +237,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
 
     shortest_latlon = left_latlon if path_len(left_latlon) < path_len(right_latlon) else right_latlon
 
-    # ---- 上绕弧线 ----
-    # 取障碍物边界上离直线最远的点作为参考，向外偏移生成控制点
+    # 上绕弧线
     max_dist = 0
     best_pt = None
     for x, y in coords:
@@ -249,21 +246,18 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
             max_dist = d
             best_pt = (x, y)
 
-    over_curve = None
+    over_curve = shortest_latlon  # fallback
     if best_pt is not None:
         s = cross_z(best_pt)
         perp = (-dir_vec[1], dir_vec[0]) if s > 0 else (dir_vec[1], -dir_vec[0])
         perp_len = math.hypot(perp[0], perp[1])
         if perp_len > 0:
             perp = (perp[0]/perp_len, perp[1]/perp_len)
-
-        # 控制点：最远点向外偏移20米（度数）
         offset_deg = 20.0 / ((meter_per_deg_lat + meter_per_deg_lon) / 2.0)
         control_x = best_pt[0] + perp[0] * offset_deg
         control_y = best_pt[1] + perp[1] * offset_deg
         control_pt = (control_x, control_y)
 
-        # 二次贝塞尔曲线
         steps = 30
         over_path = []
         for i in range(steps+1):
@@ -272,20 +266,14 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
             y = (1-t)**2 * start[1] + 2*(1-t)*t * control_pt[1] + t**2 * end[1]
             over_path.append((x, y))
 
-        # 安全检查：确保弧线不在缓冲区内
         if all(Point(x, y).distance(merged) > buffer_deg * 0.5 for x, y in over_path):
-            over_latlon = to_lat_lng(over_path)
-        else:
-            # 不安全则使用最短绕飞
-            over_latlon = shortest_latlon
-    else:
-        over_latlon = shortest_latlon
+            over_curve = to_lat_lng(over_path)
 
     return {
         "left": left_latlon,
         "right": right_latlon,
         "shortest": shortest_latlon,
-        "over": over_latlon
+        "over": over_curve
     }
 
 # ==================== 左侧面板 ====================
@@ -319,7 +307,6 @@ with col_left:
         st.markdown("### 🚧 障碍物圈选")
         name = st.text_input("障碍物名称", "教学楼")
         height = st.number_input("高度(m)", 1, 500, 25)
-
         st.info(f"当前已打点：{len(st.session_state.draw_points)} 个")
         if st.button("🧹 清空当前打点", use_container_width=True):
             st.session_state.draw_points = []
@@ -388,10 +375,8 @@ with col_right:
                 tiles="https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
                 attr="© 高德", name="高德地图", max_zoom=20).add_to(m)
 
-        # 原始直飞虚线
         folium.PolyLine([[latA, lngA], [latB, lngB]], color="red", weight=2, opacity=0.6, dash_array="5,5").add_to(m)
 
-        # 左右路径（不再重复添加起终点）
         if left_pts:
             folium.PolyLine([[latA, lngA]] + left_pts + [[latB, lngB]], color="blue", weight=3, popup="左绕").add_to(m)
         if right_pts:
@@ -431,7 +416,6 @@ with col_right:
                 st.rerun()
 
         st.markdown("---")
-        # 为用户提供上绕或绕飞选择
         if over_pts:
             col_path1, col_path2, col_path3 = st.columns(3)
             with col_path1:
@@ -460,7 +444,6 @@ with col_right:
                 st.success("直飞航线已设置。")
 
     else:
-        # 飞行监控页面（保持原样，仅在无法显示航线时提示）
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
         st.markdown("### 📡 通信链路拓扑与数据流")
         link_cols = st.columns(4)
@@ -506,7 +489,6 @@ with col_right:
                 btn_col3.button("⏸️ 暂停任务", disabled=True)
 
             if st.session_state.flight_status in ("running", "paused"):
-                # 飞行进度计算（同之前）
                 waypoint_list = waypoints
                 total_distance = 0.0
                 segments = []
@@ -570,7 +552,6 @@ with col_right:
                 folium.Marker([cur_lat, cur_lon], icon=folium.Icon(color="blue", icon="plane", prefix="fa")).add_to(m2)
                 st_folium.st_folium(m2, width=1400, height=400)
 
-        # 心跳监测（保持不变）
         st.markdown("---")
         st.markdown("### 💓 地面站心跳监测")
         if not st.session_state.running:
