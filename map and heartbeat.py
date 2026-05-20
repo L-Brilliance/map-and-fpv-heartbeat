@@ -103,21 +103,18 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 # ==================== 日志工具 ====================
-# 业务操作日志（用户行为）
 def add_operate_log(msg):
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     log = f"[{t}] <span class='log-gray'>{msg}</span>"
     st.session_state.operate_logs.append(log)
     st.session_state.operate_logs = st.session_state.operate_logs[-40:]
 
-# 下发指令日志 GCS->OBC->FCU
 def add_tx_log(msg):
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     log = f"[{t}] <span class='log-blue'>{msg}</span>"
     st.session_state.tx_logs.append(log)
     st.session_state.tx_logs = st.session_state.tx_logs[-30:]
 
-# 回传数据日志 FCU->OBC->GCS
 def add_rx_log(msg):
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     log = f"[{t}] <span class='log-yellow'>{msg}</span>"
@@ -197,7 +194,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         for i, (x, y) in enumerate(coords):
             d = math.hypot(x - point.x, y - point.y)
             if d < best:
-                best, idx = i
+                best, idx = d, i
         return idx
 
     i_entry = nearest_idx(entry, coords)
@@ -392,10 +389,6 @@ with col_right:
 
         fly_h = st.number_input("飞行高度(m)", 1, 500, 50)
         map_type = st.radio("🗺️ 地图模式", ["高德普通地图", "卫星影像地图"], horizontal=True)
-        if map_type == "卫星影像地图":
-            add_operate_log("切换地图为卫星影像模式")
-        else:
-            add_operate_log("切换地图为高德普通地图模式")
 
         paths = compute_avoid_path(latA, lngA, latB, lngB, fly_h, st.session_state.obstacles, st.session_state.safety_radius)
         left_pts = paths["left"]
@@ -497,7 +490,6 @@ with col_right:
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
         st.markdown("### 📡 通信链路拓扑与数据流")
         
-        # 拓扑在线状态
         link_cols = st.columns(4)
         link_cols[0].success("🟢 GCS 在线")
         link_cols[1].success("🟢 OBC 在线")
@@ -505,10 +497,8 @@ with col_right:
         link_cols[3].info("📶 链路正常")
 
         st.divider()
-        # 三栏日志：业务流程 + 下发 + 回传
         log_col0, log_col1, log_col2 = st.columns(3)
 
-        # 1. 业务流程日志（新增板块）
         with log_col0:
             st.markdown("#### 📝 业务流程")
             log_html = "<div class='log-box'>"
@@ -517,7 +507,6 @@ with col_right:
             log_html += "</div>"
             st.markdown(log_html, unsafe_allow_html=True)
 
-        # 2. GCS下发指令
         with log_col1:
             st.markdown("#### 📤 GCS → OBC → FCU")
             log_html = "<div class='log-box'>"
@@ -526,7 +515,6 @@ with col_right:
             log_html += "</div>"
             st.markdown(log_html, unsafe_allow_html=True)
 
-        # 3. FCU回传数据
         with log_col2:
             st.markdown("#### 📥 FCU → OBC → GCS")
             log_html = "<div class='log-box'>"
@@ -577,7 +565,7 @@ with col_right:
                     st.session_state.elapsed_flight = 0.0
                     st.session_state.flight_start_time = None
                     st.session_state.last_wp = -1
-                    add_operate_log("用户手动重置清空本次飞行任务")
+                    add_operate_log("用户手动重置本次飞行任务")
                     save_state()
                     st.rerun()
                 btn_col3.button("⏸️ 暂停任务", disabled=True)
@@ -623,18 +611,16 @@ with col_right:
                 current_wp = min(seg_idx + 1, total_wp)
                 wp_disp = f"{current_wp}/{total_wp}"
 
-                # 自动航点到达记录
                 if current_wp > st.session_state.get("last_wp", -1) and current_wp <= total_wp:
                     st.session_state.last_wp = current_wp
                     add_rx_log(f"FCU→OBC→GCS: WP_REACHED #{current_wp}")
                     if current_wp == total_wp:
                         add_rx_log("FCU→OBC→GCS: MISSION_COMPLETE")
-                        add_operate_log("飞行航线全部航点抵达，任务自动完成")
+                        add_operate_log("飞行任务全部完成，已抵达终点")
 
                 batt = max(0.0, 100 - (flown / total_distance * 100)) if total_distance > 0 else 100.0
                 elapsed_str = str(datetime.timedelta(seconds=int(current_elapsed)))
 
-                # 飞行状态指标
                 cols = st.columns(5)
                 cols[0].metric("当前航点", wp_disp)
                 cols[1].metric("飞行速度", f"{SPEED:.1f} m/s")
@@ -646,7 +632,6 @@ with col_right:
                 progress = flown / total_distance if total_distance > 0 else 1.0
                 st.progress(min(progress, 1.0))
 
-                # 实时飞行地图
                 m2 = folium.Map(location=[cur_lat, cur_lon], zoom_start=17)
                 folium.PolyLine(waypoint_list, color="orange", weight=4).add_to(m2)
                 folium.Marker(waypoint_list[0], icon=folium.Icon(color="green"), popup="起点").add_to(m2)
@@ -654,19 +639,18 @@ with col_right:
                 folium.Marker([cur_lat, cur_lon], icon=folium.Icon(color="blue", icon="plane", prefix="fa"), popup="无人机").add_to(m2)
                 st_folium.st_folium(m2, width=1400, height=400)
 
-        # 心跳监测
         st.markdown("---")
         st.markdown("### 💓 地面站心跳监测")
         if not st.session_state.running:
             if st.button("▶️ 开始心跳监测"):
                 st.session_state.running = True
-                add_operate_log("用户开启地面站心跳数据监测")
+                add_operate_log("开启心跳监测")
                 save_state()
                 st.rerun()
         else:
             if st.button("⏸️ 停止心跳监测"):
                 st.session_state.running = False
-                add_operate_log("用户关闭地面站心跳数据监测")
+                add_operate_log("停止心跳监测")
                 save_state()
                 st.rerun()
 
@@ -679,7 +663,6 @@ with col_right:
             st.line_chart(df.set_index("时间")["序号"])
             st.dataframe(df, use_container_width=True)
 
-# 自动刷新
 if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.running):
     time.sleep(1)
     st.rerun()
