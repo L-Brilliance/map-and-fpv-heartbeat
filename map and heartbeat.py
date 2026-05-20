@@ -526,12 +526,13 @@ with col_right:
                 total_wp = len(waypoint_list) - 1
                 wp_disp = f"{min(seg_idx+1, total_wp)}/{total_wp}"
 
-                # 已移除预计到达计算，仅保留调试行
+                # 预计秒数（仅用于调试，不显示在界面主指标中）
+                eta_seconds = remain / SPEED
                 batt = max(0.0, 100 - 100*flown/total_distance) if total_distance > 0 else 100.0
                 elapsed_str = str(datetime.timedelta(seconds=int(current_elapsed)))
 
                 st.markdown("---")
-                # 指标改为4列（去掉预计到达）
+                # 主指标：4列（无“预计到达”）
                 cols = st.columns(4)
                 cols[0].metric("当前航点", wp_disp)
                 cols[1].metric("飞行速度", f"{SPEED:.1f} m/s")
@@ -540,8 +541,8 @@ with col_right:
                 st.markdown(f"""<div style="background-color:#f3e5f5; border-radius:10px; padding:10px; margin-bottom:10px;">
                 <strong>🔋 电量模拟</strong>&nbsp;&nbsp;<span style="font-size:1.2em; color:{'red' if batt<20 else 'green'}">{batt:.1f}%</span></div>""", unsafe_allow_html=True)
 
-                # 保留调试信息
-                st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s")
+                # 调试行：保留预计秒数
+                st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s | 预计秒数: {eta_seconds:.2f} s")
 
                 progress = flown / total_distance if total_distance > 0 else 1.0
                 st.progress(min(progress, 1.0))
