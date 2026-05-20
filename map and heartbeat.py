@@ -17,6 +17,11 @@ st.set_page_config(page_title="南京科技职业学院 - 无人机导航系统"
 st.markdown("""
 <style>
 .left-panel {background:#f8f9fa; padding:20px; border-radius:10px; height:95vh;}
+.log-box {background-color:#1E1E1E; color:#FFFFFF; padding:12px; border-radius:8px; height:380px; overflow-y:auto; font-family:monospace; font-size:14px; line-height:1.5;}
+.log-yellow {color:#FFC107;}
+.log-blue {color:#03A9F4;}
+.log-green {color:#4CAF50;}
+.log-time {color:#999;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -39,6 +44,8 @@ def save_state():
         "flight_status": st.session_state.flight_status,
         "flight_start_time": st.session_state.flight_start_time,
         "safety_radius": st.session_state.safety_radius,
+        "tx_logs": st.session_state.get("tx_logs", []),
+        "rx_logs": st.session_state.get("rx_logs", []),
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -70,6 +77,9 @@ def ensure_session_state():
         "flight_speed": 8.5,
         "safety_radius": 5.0,
         "elapsed_flight": 0.0,
+        "tx_logs": [],
+        "rx_logs": [],
+        "last_wp": -1,
     }
     loaded = load_state()
     for key, default_value in defaults.items():
@@ -233,7 +243,6 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
 
     shortest_latlon = left_latlon if path_len(left_latlon) < path_len(right_latlon) else right_latlon
 
-    # 上绕弧线
     max_dist = 0
     best_pt = None
     for x, y in coords:
@@ -271,6 +280,19 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         "shortest": shortest_latlon,
         "over": over_curve
     }
+
+# ==================== 日志工具 ====================
+def add_tx_log(msg):
+    t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    log = f"[{t}] <span class='log-blue'>{msg}</span>"
+    st.session_state.tx_logs.append(log)
+    st.session_state.tx_logs = st.session_state.tx_logs[-30:]
+
+def add_rx_log(msg):
+    t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    log = f"[{t}] <span class='log-yellow'>{msg}</span>"
+    st.session_state.rx_logs.append(log)
+    st.session_state.rx_logs = st.session_state.rx_logs[-30:]
 
 # ==================== 左侧面板 ====================
 col_left, col_right = st.columns([1, 3])
@@ -418,36 +440,63 @@ with col_right:
                 if st.button("🛩️ 上绕越障", use_container_width=True):
                     st.session_state.waypoints = [[latA, lngA]] + over_pts + [[latB, lngB]]
                     st.session_state.flight_status = "idle"
+                    add_tx_log("GCS→OBC→FCU: 上传航线任务")
                     save_state()
                     st.success("上绕航线已设置！")
             with col_path2:
                 if st.button("🛩️ 左绕航线", use_container_width=True):
                     st.session_state.waypoints = [[latA, lngA]] + left_pts + [[latB, lngB]]
                     st.session_state.flight_status = "idle"
+                    add_tx_log("GCS→OBC→FCU: 上传航线任务")
                     save_state()
                     st.success("左绕航线已设置！")
             with col_path3:
                 if st.button("🛩️ 右绕航线", use_container_width=True):
                     st.session_state.waypoints = [[latA, lngA]] + right_pts + [[latB, lngB]]
                     st.session_state.flight_status = "idle"
+                    add_tx_log("GCS→OBC→FCU: 上传航线任务")
                     save_state()
                     st.success("右绕航线已设置！")
         else:
             if st.button("🛩️ 使用直飞航线", use_container_width=True):
                 st.session_state.waypoints = [[latA, lngA], [latB, lngB]]
                 st.session_state.flight_status = "idle"
+                add_tx_log("GCS→OBC→FCU: 上传航线任务")
                 save_state()
                 st.success("直飞航线已设置。")
 
     else:
-        # ==================== 飞行监控页面 ====================
         st.markdown("## ✈️ 飞行实时画面 - 任务执行监控")
         st.markdown("### 📡 通信链路拓扑与数据流")
+        
+        # ========== 拓扑状态 ==========
         link_cols = st.columns(4)
-        link_cols[0].success("🟢 GCS在线")
-        link_cols[1].success("🟢 OBC在线")
-        link_cols[2].success("🟢 FCU在线")
+        link_cols[0].success("🟢 GCS 在线")
+        link_cols[1].success("🟢 OBC 在线")
+        link_cols[2].success("🟢 FCU 在线")
+        link_cols[3].info("📶 链路正常")
 
+        st.divider()
+
+        # ========== 双日志栏 ==========
+        log_col1, log_col2 = st.columns(2)
+        with log_col1:
+            st.markdown("#### 📤 GCS → OBC → FCU")
+            log_html = "<div class='log-box'>"
+            for line in st.session_state.get("tx_logs", []):
+                log_html += f"{line}<br>"
+            log_html += "</div>"
+            st.markdown(log_html, unsafe_allow_html=True)
+
+        with log_col2:
+            st.markdown("#### 📥 FCU → OBC → GCS")
+            log_html = "<div class='log-box'>"
+            for line in st.session_state.get("rx_logs", []):
+                log_html += f"{line}<br>"
+            log_html += "</div>"
+            st.markdown(log_html, unsafe_allow_html=True)
+
+        st.divider()
         waypoints = st.session_state.waypoints
         if not waypoints:
             st.warning("⚠️ 尚未设置航线，请先在航线规划页面计算并应用航线。")
@@ -458,9 +507,13 @@ with col_right:
                     st.session_state.flight_status = "running"
                     st.session_state.flight_start_time = time.time()
                     st.session_state.elapsed_flight = 0.0
+                    st.session_state.last_wp = -1
+                    add_tx_log("GCS→OBC→FCU: 启动任务 AUTO")
+                    add_rx_log("FCU→OBC→GCS: ACK | Mode: AUTO")
                     save_state()
                     st.rerun()
                 btn_col2.button("⏸️ 暂停任务", disabled=True)
+
             elif st.session_state.flight_status == "running":
                 btn_col1, btn_col2 = st.columns(2)
                 btn_col1.button("▶️ 开始任务", disabled=True)
@@ -469,6 +522,7 @@ with col_right:
                     st.session_state.flight_status = "paused"
                     save_state()
                     st.rerun()
+
             elif st.session_state.flight_status == "paused":
                 btn_col1, btn_col2, btn_col3 = st.columns(3)
                 if btn_col1.button("▶️ 继续任务", use_container_width=True):
@@ -480,6 +534,7 @@ with col_right:
                     st.session_state.flight_status = "idle"
                     st.session_state.elapsed_flight = 0.0
                     st.session_state.flight_start_time = None
+                    st.session_state.last_wp = -1
                     save_state()
                     st.rerun()
                 btn_col3.button("⏸️ 暂停任务", disabled=True)
@@ -489,8 +544,7 @@ with col_right:
                 total_distance = 0.0
                 segments = []
                 for i in range(len(waypoint_list)-1):
-                    d = haversine(waypoint_list[i][0], waypoint_list[i][1],
-                                  waypoint_list[i+1][0], waypoint_list[i+1][1])
+                    d = haversine(waypoint_list[i][0], waypoint_list[i][1], waypoint_list[i+1][0], waypoint_list[i+1][1])
                     segments.append(d)
                     total_distance += d
 
@@ -502,13 +556,12 @@ with col_right:
                 SPEED = 8.5
                 flown = min(current_elapsed * SPEED, total_distance)
                 remain = total_distance - flown
+                eta_seconds = remain / SPEED if SPEED > 0 else 0
 
-                if total_distance == 0:
-                    cur_lat, cur_lon = waypoint_list[0]
-                    seg_idx = 0
-                else:
+                cur_lat, cur_lon = waypoint_list[0]
+                seg_idx = 0
+                if total_distance > 0:
                     cum = 0.0
-                    seg_idx = 0
                     for i, d in enumerate(segments):
                         if cum + d >= flown:
                             seg_idx = i
@@ -524,39 +577,41 @@ with col_right:
                         cur_lat, cur_lon = waypoint_list[-1]
 
                 total_wp = len(waypoint_list) - 1
-                wp_disp = f"{min(seg_idx+1, total_wp)}/{total_wp}"
+                current_wp = min(seg_idx + 1, total_wp)
+                wp_disp = f"{current_wp}/{total_wp}"
 
-                # 预计秒数（仅用于调试，不显示在界面主指标中）
-                eta_seconds = remain / SPEED
-                batt = max(0.0, 100 - 100*flown/total_distance) if total_distance > 0 else 100.0
+                # 自动生成航点到达日志
+                if current_wp > st.session_state.get("last_wp", -1) and current_wp <= total_wp:
+                    st.session_state.last_wp = current_wp
+                    add_rx_log(f"FCU→OBC→GCS: WP_REACHED #{current_wp}")
+                    if current_wp == total_wp:
+                        add_rx_log("FCU→OBC→GCS: MISSION_COMPLETE")
+
+                # 电量
+                batt = max(0.0, 100 - (flown / total_distance * 100)) if total_distance > 0 else 100.0
                 elapsed_str = str(datetime.timedelta(seconds=int(current_elapsed)))
 
-                st.markdown("---")
-                # 主指标：4列（无“预计到达”）
-                cols = st.columns(4)
+                # 显示面板
+                cols = st.columns(5)
                 cols[0].metric("当前航点", wp_disp)
                 cols[1].metric("飞行速度", f"{SPEED:.1f} m/s")
                 cols[2].metric("已用时间", elapsed_str)
                 cols[3].metric("剩余距离", f"{remain:.1f} m")
-                st.markdown(f"""<div style="background-color:#f3e5f5; border-radius:10px; padding:10px; margin-bottom:10px;">
-                <strong>🔋 电量模拟</strong>&nbsp;&nbsp;<span style="font-size:1.2em; color:{'red' if batt<20 else 'green'}">{batt:.1f}%</span></div>""", unsafe_allow_html=True)
+                cols[4].metric("电量模拟", f"{batt:.1f}%")
 
-                # 调试行：保留预计秒数
-                st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s | 预计秒数: {eta_seconds:.2f} s")
-
+                st.write(f"DEBUG | 剩余距离: {remain:.2f}m | 速度: {SPEED} m/s | 预计秒数: {eta_seconds:.2f}s")
                 progress = flown / total_distance if total_distance > 0 else 1.0
                 st.progress(min(progress, 1.0))
-                st.caption(f"任务进度：{progress*100:.1f}%" if total_distance else "已完成")
 
-                m2 = folium.Map(location=[cur_lat, cur_lon], zoom_start=17, control_scale=True)
-                if len(waypoint_list) > 1:
-                    folium.PolyLine(waypoint_list, color="orange", weight=3).add_to(m2)
-                folium.Marker(waypoint_list[0], icon=folium.Icon(color="green")).add_to(m2)
-                folium.Marker(waypoint_list[-1], icon=folium.Icon(color="red")).add_to(m2)
-                folium.Marker([cur_lat, cur_lon], icon=folium.Icon(color="blue", icon="plane", prefix="fa")).add_to(m2)
+                # 实时地图
+                m2 = folium.Map(location=[cur_lat, cur_lon], zoom_start=17)
+                folium.PolyLine(waypoint_list, color="orange", weight=4).add_to(m2)
+                folium.Marker(waypoint_list[0], icon=folium.Icon(color="green"), popup="起点").add_to(m2)
+                folium.Marker(waypoint_list[-1], icon=folium.Icon(color="red"), popup="终点").add_to(m2)
+                folium.Marker([cur_lat, cur_lon], icon=folium.Icon(color="blue", icon="plane", prefix="fa"), popup="无人机").add_to(m2)
                 st_folium.st_folium(m2, width=1400, height=400)
 
-        # 心跳监测
+        # 心跳
         st.markdown("---")
         st.markdown("### 💓 地面站心跳监测")
         if not st.session_state.running:
@@ -575,18 +630,9 @@ with col_right:
             t = datetime.datetime.now().strftime("%H:%M:%S")
             st.session_state.heartbeat_data.append({"序号": st.session_state.seq, "时间": t, "状态": "正常"})
             save_state()
-            with st.empty():
-                df = pd.DataFrame(st.session_state.heartbeat_data)
-                st.line_chart(df.set_index("时间")["序号"])
-                st.dataframe(df, use_container_width=True)
-            time.sleep(1)
-        else:
-            if st.session_state.heartbeat_data:
-                df = pd.DataFrame(st.session_state.heartbeat_data)
-                st.line_chart(df.set_index("时间")["序号"])
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("暂无心跳数据")
+            df = pd.DataFrame(st.session_state.heartbeat_data[-20:])
+            st.line_chart(df.set_index("时间")["序号"])
+            st.dataframe(df, use_container_width=True)
 
 if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.running):
     time.sleep(1)
