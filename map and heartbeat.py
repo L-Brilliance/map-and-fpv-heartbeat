@@ -37,9 +37,8 @@ def save_state():
         "seq": st.session_state.seq,
         "running": st.session_state.running,
         "flight_status": st.session_state.flight_status,
-        "flight_start_time": st.session_state.flight_start_time.isoformat() if st.session_state.flight_start_time else None,
+        "flight_start_time": st.session_state.flight_start_time,  # 直接存浮点数
         "safety_radius": st.session_state.safety_radius,
-        # 不再保存 flight_speed，强制使用默认 8.5
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -48,8 +47,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if data.get("flight_start_time"):
-            data["flight_start_time"] = datetime.datetime.fromisoformat(data["flight_start_time"])
+        # flight_start_time 已经是浮点数，不用转换
         return data
     return {}
 
@@ -70,7 +68,7 @@ def ensure_session_state():
         "running": False,
         "flight_status": "idle",
         "flight_start_time": None,
-        "flight_speed": 8.5,         # 始终使用 8.5
+        "flight_speed": 8.5,
         "safety_radius": 5.0,
         "elapsed_flight": 0.0,
     }
@@ -78,7 +76,7 @@ def ensure_session_state():
     for key, default_value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = loaded.get(key, default_value)
-    # 强制重设速度，避免任何持久化污染
+    # 确保 speed 始终为 8.5
     st.session_state.flight_speed = 8.5
     if "init" not in st.session_state:
         st.session_state.init = True
@@ -92,7 +90,7 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-# ==================== 绕飞算法（同前） ====================
+# ==================== 绕飞算法 ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     start = (lngA, latA)
     end = (lngB, latB)
@@ -460,7 +458,7 @@ with col_right:
                 btn_col1, btn_col2 = st.columns(2)
                 if btn_col1.button("▶️ 开始任务", use_container_width=True):
                     st.session_state.flight_status = "running"
-                    st.session_state.flight_start_time = time.time()  # 使用 time.time() 避免 datetime 精度问题
+                    st.session_state.flight_start_time = time.time()
                     st.session_state.elapsed_flight = 0.0
                     save_state()
                     st.rerun()
@@ -503,8 +501,7 @@ with col_right:
                 else:
                     current_elapsed = st.session_state.elapsed_flight
 
-                # 速度固定为 8.5，不受任何持久化影响
-                SPEED = 8.5
+                SPEED = 8.5  # 固定速度
                 flown = min(current_elapsed * SPEED, total_distance)
                 remain = total_distance - flown
 
@@ -531,7 +528,6 @@ with col_right:
                 total_wp = len(waypoint_list) - 1
                 wp_disp = f"{min(seg_idx+1, total_wp)}/{total_wp}"
 
-                # ★ 核心修改：严格按照公式 预计到达秒数 = 剩余距离(m) / 飞行速度(m/s)
                 eta_seconds = remain / SPEED
                 eta = (datetime.datetime.now() + datetime.timedelta(seconds=eta_seconds)).strftime("%H:%M:%S")
                 batt = max(0.0, 100 - 100*flown/total_distance) if total_distance > 0 else 100.0
@@ -547,7 +543,6 @@ with col_right:
                 st.markdown(f"""<div style="background-color:#f3e5f5; border-radius:10px; padding:10px; margin-bottom:10px;">
                 <strong>🔋 电量模拟</strong>&nbsp;&nbsp;<span style="font-size:1.2em; color:{'red' if batt<20 else 'green'}">{batt:.1f}%</span></div>""", unsafe_allow_html=True)
 
-                # 🔍 调试输出：直接显示参与计算的值
                 st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s | 预计秒数: {eta_seconds:.2f} s")
 
                 progress = flown / total_distance if total_distance > 0 else 1.0
@@ -594,7 +589,6 @@ with col_right:
             else:
                 st.info("暂无心跳数据")
 
-# 自动刷新
 if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.running):
     time.sleep(1)
     st.rerun()
