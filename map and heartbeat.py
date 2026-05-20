@@ -37,7 +37,7 @@ def save_state():
         "seq": st.session_state.seq,
         "running": st.session_state.running,
         "flight_status": st.session_state.flight_status,
-        "flight_start_time": st.session_state.flight_start_time,  # 直接存浮点数
+        "flight_start_time": st.session_state.flight_start_time,
         "safety_radius": st.session_state.safety_radius,
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -47,7 +47,6 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        # flight_start_time 已经是浮点数，不用转换
         return data
     return {}
 
@@ -76,7 +75,6 @@ def ensure_session_state():
     for key, default_value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = loaded.get(key, default_value)
-    # 确保 speed 始终为 8.5
     st.session_state.flight_speed = 8.5
     if "init" not in st.session_state:
         st.session_state.init = True
@@ -501,7 +499,7 @@ with col_right:
                 else:
                     current_elapsed = st.session_state.elapsed_flight
 
-                SPEED = 8.5  # 固定速度
+                SPEED = 8.5
                 flown = min(current_elapsed * SPEED, total_distance)
                 remain = total_distance - flown
 
@@ -528,22 +526,22 @@ with col_right:
                 total_wp = len(waypoint_list) - 1
                 wp_disp = f"{min(seg_idx+1, total_wp)}/{total_wp}"
 
-                eta_seconds = remain / SPEED
-                eta = (datetime.datetime.now() + datetime.timedelta(seconds=eta_seconds)).strftime("%H:%M:%S")
+                # 已移除预计到达计算，仅保留调试行
                 batt = max(0.0, 100 - 100*flown/total_distance) if total_distance > 0 else 100.0
                 elapsed_str = str(datetime.timedelta(seconds=int(current_elapsed)))
 
                 st.markdown("---")
-                cols = st.columns(5)
+                # 指标改为4列（去掉预计到达）
+                cols = st.columns(4)
                 cols[0].metric("当前航点", wp_disp)
                 cols[1].metric("飞行速度", f"{SPEED:.1f} m/s")
                 cols[2].metric("已用时间", elapsed_str)
                 cols[3].metric("剩余距离", f"{remain:.1f} m")
-                cols[4].metric("预计到达", eta)
                 st.markdown(f"""<div style="background-color:#f3e5f5; border-radius:10px; padding:10px; margin-bottom:10px;">
                 <strong>🔋 电量模拟</strong>&nbsp;&nbsp;<span style="font-size:1.2em; color:{'red' if batt<20 else 'green'}">{batt:.1f}%</span></div>""", unsafe_allow_html=True)
 
-                st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s | 预计秒数: {eta_seconds:.2f} s")
+                # 保留调试信息
+                st.write(f"🔍 DEBUG | 剩余距离: {remain:.2f} m | 速度: {SPEED} m/s")
 
                 progress = flown / total_distance if total_distance > 0 else 1.0
                 st.progress(min(progress, 1.0))
