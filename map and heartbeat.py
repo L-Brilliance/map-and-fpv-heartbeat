@@ -178,7 +178,7 @@ def render_mavlink_view():
             add_rx_log("FCU→OBC→GCS: MAV_MSG GLOBAL_POSITION_INT 全局位置上报")
             st.rerun()
 
-# ==================== 【新增2】GCS-OBC-FCU三层通信拓扑绘图函数 ====================
+# ==================== 【新增2】GCS-OBC-FCU三层通信拓扑绘图函数（已修复字符串语法错误） ====================
 def draw_comm_topology():
     st.markdown("<div class='topology-card'>", unsafe_allow_html=True)
     st.subheader("🔗 GCS-OBC-FCU 无人机三层通信拓扑结构图")
@@ -201,8 +201,8 @@ def draw_comm_topology():
                 "links": [
                     {"source": "GCS地面站", "target": "OBC机载计算机", "value": "无线数传 MAVLink双向"},
                     {"source": "OBC机载计算机", "target": "FCU Pixhawk6X飞控", "value": "UART/CAN MAVLink指令/遥测"},
-                    {"source": "FCU Pixhawk6X飞控", "target": "IMU/GPS/避障传感器", "value": I2C/CAN 原始传感数据},
-                    {"source": "OBC机载计算机", "target": "任务载荷(云台/相机)", "value": USB/以太网 图像与云台控制}
+                    {"source": "FCU Pixhawk6X飞控", "target": "IMU/GPS/避障传感器", "value": "I2C/CAN 原始传感数据"},
+                    {"source": "OBC机载计算机", "target": "任务载荷(云台/相机)", "value": "USB/以太网 图像与云台控制"}
                 ],
                 "force": {"repulsion": 900}
             }
@@ -393,7 +393,7 @@ def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_rad
         "over": over_curve
     }
 
-# ==================== 左侧面板（新增拓扑/MAV页面选项，原有功能完全保留） ====================
+# ==================== 左侧面板 ====================
 col_left, col_right = st.columns([1, 3])
 
 with col_left:
