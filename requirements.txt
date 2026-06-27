@@ -1,7 +1,8 @@
 streamlit
-folium
 streamlit-folium
-streamlit-option-menu
+folium
 pandas
 numpy
 shapely
+streamlit-echarts
+pymavlink
