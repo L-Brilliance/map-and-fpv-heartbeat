@@ -65,12 +65,10 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
                 if not content:
-                    # 文件为空，直接返回空
                     return {}
                 data = json.loads(content)
                 return data
         except (json.JSONDecodeError, Exception):
-            # JSON损坏/读取异常，删除损坏文件，返回空状态
             os.remove(STATE_FILE)
             return {}
     return {}
@@ -135,7 +133,7 @@ def add_rx_log(msg):
     st.session_state.rx_logs.append(log)
     st.session_state.rx_logs = st.session_state.rx_logs[-30:]
 
-# ==================== MAV报文模拟（纯消息类构造，无网络、无encode报错） ====================
+# ==================== MAV报文模拟（全部消息保留，常量替换为数字，无网络） ====================
 def add_mav_packet(packet_msg, direction):
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     pkt_type = packet_msg.get_type()
@@ -164,8 +162,8 @@ def render_mavlink_view():
         if st.button("模拟下发航点MAV包", use_container_width=True):
             msg = mavutil.mavlink.MAVLink_mission_item_message(
                 0, 0, 0,
-                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                6,
+                16,
                 0, 1, 5.0, 0.0, 0.0, 0.0,
                 32.2335, 118.7475, 50.0
             )
@@ -641,13 +639,10 @@ with col_right:
                     add_operate_log("用户手动点击开始执行飞行任务")
                     add_tx_log("GCS→OBC→FCU: 启动任务 AUTO")
                     add_rx_log("FCU→OBC→GCS: ACK | Mode: AUTO")
-                    start_mav = mavutil.mavlink.MAVLink_set_mode_message(
-                        0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION
-                    )
+                    # SET_MODE 数字常量：base_mode=4(AUTO), custom_mode=3(AUTO_MISSION)
+                    start_mav = mavutil.mavlink.MAVLink_set_mode_message(0, 4, 3)
                     add_mav_packet(start_mav, "tx")
-                    ack_mav = mavutil.mavlink.MAVLink_command_ack_message(
-                        mavutil.mavlink.MAV_CMD_MISSION_START, 0,0,0,0,0,0,0
-                    )
+                    ack_mav = mavutil.mavlink.MAVLink_command_ack_message(45,0,0,0,0,0,0)
                     add_mav_packet(ack_mav, "rx")
                     save_state()
                     st.rerun()
@@ -660,9 +655,8 @@ with col_right:
                     st.session_state.elapsed_flight += time.time() - st.session_state.flight_start_time
                     st.session_state.flight_status = "paused"
                     add_operate_log("用户手动暂停当前飞行任务")
-                    pause_mav = mavutil.mavlink.MAVLink_set_mode_message(
-                        0, mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED, mavutil.mavlink.MAV_MODE_STABILIZE_HOLD
-                    )
+                    # base_mode=2(STABILIZE), custom_mode=4(HOLD)
+                    pause_mav = mavutil.mavlink.MAVLink_set_mode_message(0, 2, 4)
                     add_mav_packet(pause_mav, "tx")
                     save_state()
                     st.rerun()
@@ -673,9 +667,7 @@ with col_right:
                     st.session_state.flight_start_time = time.time()
                     st.session_state.flight_status = "running"
                     add_operate_log("用户手动恢复继续飞行任务")
-                    resume_mav = mavutil.mavlink.MAVLink_set_mode_message(
-                        0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION
-                    )
+                    resume_mav = mavutil.mavlink.MAVLink_set_mode_message(0, 4, 3)
                     add_mav_packet(resume_mav, "tx")
                     save_state()
                     st.rerun()
@@ -739,7 +731,7 @@ with col_right:
                     add_mav_packet(wp_mav, "rx")
                     if current_wp == total_wp:
                         add_rx_log("FCU→OBC→GCS: MISSION_COMPLETE")
-                        finish_mav = mavutil.mavlink.MAVLink_mission_ack_message(0, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+                        finish_mav = mavutil.mavlink.MAVLink_mission_ack_message(0, 0)
                         add_mav_packet(finish_mav, "rx")
                         add_operate_log("飞行任务全部完成，已抵达终点")
 
@@ -783,11 +775,8 @@ with col_right:
             st.session_state.seq += 1
             t = datetime.datetime.now().strftime("%H:%M:%S")
             st.session_state.heartbeat_data.append({"序号": st.session_state.seq, "时间": t, "状态": "正常"})
-            hb_mav = mavutil.mavlink.MAVLink_heartbeat_message(
-                mavutil.mavlink.MAV_TYPE_QUADROTOR,
-                mavutil.mavlink.MAV_AUTOPILOT_PX4,
-                0, 0, 0, 0
-            )
+            # 心跳消息，数字常量
+            hb_mav = mavutil.mavlink.MAVLink_heartbeat_message(2,12,0,0,0,0)
             add_mav_packet(hb_mav, "rx")
             save_state()
             df = pd.DataFrame(st.session_state.heartbeat_data[-20:])
