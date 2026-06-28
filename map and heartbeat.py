@@ -61,9 +61,18 @@ def save_state():
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    # 文件为空，直接返回空
+                    return {}
+                data = json.loads(content)
+                return data
+        except (json.JSONDecodeError, Exception):
+            # JSON损坏/读取异常，删除损坏文件，返回空状态
+            os.remove(STATE_FILE)
+            return {}
     return {}
 
 def ensure_session_state():
@@ -126,7 +135,7 @@ def add_rx_log(msg):
     st.session_state.rx_logs.append(log)
     st.session_state.rx_logs = st.session_state.rx_logs[-30:]
 
-# ==================== MAV报文模拟（不使用mav内存对象，直接构造消息类，无网络、无encode报错） ====================
+# ==================== MAV报文模拟（纯消息类构造，无网络、无encode报错） ====================
 def add_mav_packet(packet_msg, direction):
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     pkt_type = packet_msg.get_type()
@@ -632,7 +641,6 @@ with col_right:
                     add_operate_log("用户手动点击开始执行飞行任务")
                     add_tx_log("GCS→OBC→FCU: 启动任务 AUTO")
                     add_rx_log("FCU→OBC→GCS: ACK | Mode: AUTO")
-                    # 构造SET_MODE消息
                     start_mav = mavutil.mavlink.MAVLink_set_mode_message(
                         0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION
                     )
