@@ -56,7 +56,6 @@ def save_state():
         "rx_logs": st.session_state.get("rx_logs", []),
         "operate_logs": st.session_state.get("operate_logs", []),
         "last_wp": -1,
-        # 新增MAV报文持久化
         "mavlink_packets": st.session_state.get("mavlink_packets", [])[-50:]
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -93,10 +92,9 @@ def ensure_session_state():
         "rx_logs": [],
         "operate_logs": [],
         "last_wp": -1,
-        # 新增会话变量
         "mavlink_packets": [],
-        # 虚拟mav连接，用于生成合法报文
-        "virtual_mav_conn": None
+        # 纯内存MAV实例，无socket、无端口绑定
+        "mav_memory": None
     }
     loaded = load_state()
     for key, default_value in defaults.items():
@@ -105,8 +103,8 @@ def ensure_session_state():
     st.session_state.flight_speed = 8.5
     if "init" not in st.session_state:
         st.session_state.init = True
-        # 初始化虚拟连接，规避直接构造消息参数报错
-        st.session_state.virtual_mav_conn = mavutil.mavlink_connection('udp://127.0.0.1:14550')
+        # 纯内存MAVLink对象，不创建任何网络socket，彻底规避bind报错
+        st.session_state.mav_memory = mavutil.mavlink.MAVLink(0, 0)
 
 ensure_session_state()
 
@@ -136,9 +134,8 @@ def add_rx_log(msg):
     st.session_state.rx_logs.append(log)
     st.session_state.rx_logs = st.session_state.rx_logs[-30:]
 
-# ==================== 【新增1】MAVLink报文管理函数（修复构造参数报错） ====================
+# ==================== MAVLink报文管理（纯内存无Socket） ====================
 def add_mav_packet(packet_msg, direction):
-    """存储MAV原始报文，tx=上行GCS→FCU rx=下行FCU→GCS"""
     t = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     pkt_type = packet_msg.get_type()
     pkt_info = {
@@ -152,10 +149,8 @@ def add_mav_packet(packet_msg, direction):
     save_state()
 
 def render_mavlink_view():
-    """渲染MAV实时报文面板"""
     st.subheader("📡 MAVLink 原始数据流报文窗口")
     mav_html = "<div class='mav-box'>"
-    # 倒序展示最新报文
     for pkt in reversed(st.session_state.mavlink_packets):
         dir_text = "↑上行 GCS→FCU" if pkt["dir"] == "tx" else "↓下行 FCU→GCS"
         mav_html += f"[{pkt['time']}] {dir_text} | MSG_ID: {pkt['type']}<br>Payload: {pkt['content']}<hr style='border:#333'>"
@@ -163,12 +158,11 @@ def render_mavlink_view():
         mav_html += "<span style='color:#888'>暂无MAV报文，下发航线/启动任务自动生成报文记录</span>"
     mav_html += "</div>"
     st.markdown(mav_html, unsafe_allow_html=True)
-    # 模拟报文调试按钮
+    mav = st.session_state.mav_memory
     b1, b2 = st.columns(2)
-    mav_conn = st.session_state.virtual_mav_conn
     with b1:
         if st.button("模拟下发航点MAV包", use_container_width=True):
-            msg = mav_conn.mav.mission_item_encode(
+            msg = mav.mission_item_encode(
                 0, 0, 0,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
                 mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
@@ -180,7 +174,7 @@ def render_mavlink_view():
             st.rerun()
     with b2:
         if st.button("模拟回传位置遥测包", use_container_width=True):
-            msg = mav_conn.mav.global_position_int_encode(
+            msg = mav.global_position_int_encode(
                 int(118.7475 * 1e7), int(32.2335 * 1e7), 50000, 0,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
             )
@@ -188,7 +182,7 @@ def render_mavlink_view():
             add_rx_log("FCU→OBC→GCS: MAV_MSG GLOBAL_POSITION_INT 全局位置上报")
             st.rerun()
 
-# ==================== 【新增2】GCS-OBC-FCU三层通信拓扑绘图函数（已修复字符串语法错误） ====================
+# ==================== 通信拓扑绘图函数 ====================
 def draw_comm_topology():
     st.markdown("<div class='topology-card'>", unsafe_allow_html=True)
     st.subheader("🔗 GCS-OBC-FCU 无人机三层通信拓扑结构图")
@@ -221,7 +215,7 @@ def draw_comm_topology():
     st_echarts(options=option, height="420px", key="topology_graph")
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ==================== 绕飞算法（完全原样保留，无修改） ====================
+# ==================== 绕飞算法（无修改） ====================
 def compute_avoid_path(latA, lngA, latB, lngB, fly_height, obstacles, safety_radius_m=5.0):
     start = (lngA, latA)
     end = (lngB, latB)
@@ -409,7 +403,6 @@ col_left, col_right = st.columns([1, 3])
 with col_left:
     st.markdown('<div class="left-panel">', unsafe_allow_html=True)
     st.subheader("🧭 导航")
-    # 新增第三个页面：通信拓扑与MAV调试
     page = st.radio("", ["航线规划", "飞行监控", "通信拓扑/MAV调试"], label_visibility="collapsed")
     st.divider()
 
@@ -476,7 +469,7 @@ with col_left:
 with col_right:
     st.markdown("# 🎓 南京科技职业学院")
     st.markdown("## 无人机航线导航与监控系统")
-    mav_conn = st.session_state.virtual_mav_conn
+    mav = st.session_state.mav_memory
 
     if page == "航线规划":
         st.markdown("### 🎯 AB点航线")
@@ -562,8 +555,7 @@ with col_right:
                     st.session_state.flight_status = "idle"
                     add_operate_log("用户选定航线：上绕越障航线")
                     add_tx_log("GCS→OBC→FCU: 上传上绕越障航线任务")
-                    # 同步生成MAV航线报文
-                    msg = mav_conn.mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
+                    msg = mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
                     add_mav_packet(msg, "tx")
                     save_state()
                     st.success("上绕航线已设置！")
@@ -573,7 +565,7 @@ with col_right:
                     st.session_state.flight_status = "idle"
                     add_operate_log("用户选定航线：左侧绕行航线")
                     add_tx_log("GCS→OBC→FCU: 上传左绕航线任务")
-                    msg = mav_conn.mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
+                    msg = mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
                     add_mav_packet(msg, "tx")
                     save_state()
                     st.success("左绕航线已设置！")
@@ -583,7 +575,7 @@ with col_right:
                     st.session_state.flight_status = "idle"
                     add_operate_log("用户选定航线：右侧绕行航线")
                     add_tx_log("GCS→OBC→FCU: 上传右绕航线任务")
-                    msg = mav_conn.mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
+                    msg = mav.mission_count_encode(0, 0, len(st.session_state.waypoints))
                     add_mav_packet(msg, "tx")
                     save_state()
                     st.success("右绕航线已设置！")
@@ -593,7 +585,7 @@ with col_right:
                 st.session_state.flight_status = "idle"
                 add_operate_log("用户选定航线：两点直飞航线")
                 add_tx_log("GCS→OBC→FCU: 上传直飞航线任务")
-                msg = mav_conn.mav.mission_count_encode(0, 0, 2)
+                msg = mav.mission_count_encode(0, 0, 2)
                 add_mav_packet(msg, "tx")
                 save_state()
                 st.success("直飞航线已设置。")
@@ -650,10 +642,9 @@ with col_right:
                     add_operate_log("用户手动点击开始执行飞行任务")
                     add_tx_log("GCS→OBC→FCU: 启动任务 AUTO")
                     add_rx_log("FCU→OBC→GCS: ACK | Mode: AUTO")
-                    # 生成启动MAV报文
-                    start_mav = mav_conn.mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION)
+                    start_mav = mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION)
                     add_mav_packet(start_mav, "tx")
-                    ack_mav = mav_conn.mav.command_ack_encode(mavutil.mavlink.MAV_CMD_MISSION_START, 0, 0, 0, 0, 0, 0, 0)
+                    ack_mav = mav.command_ack_encode(mavutil.mavlink.MAV_CMD_MISSION_START, 0, 0, 0, 0, 0, 0, 0)
                     add_mav_packet(ack_mav, "rx")
                     save_state()
                     st.rerun()
@@ -666,7 +657,7 @@ with col_right:
                     st.session_state.elapsed_flight += time.time() - st.session_state.flight_start_time
                     st.session_state.flight_status = "paused"
                     add_operate_log("用户手动暂停当前飞行任务")
-                    pause_mav = mav_conn.mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED, mavutil.mavlink.MAV_MODE_STABILIZE_HOLD)
+                    pause_mav = mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_STABILIZE_ENABLED, mavutil.mavlink.MAV_MODE_STABILIZE_HOLD)
                     add_mav_packet(pause_mav, "tx")
                     save_state()
                     st.rerun()
@@ -677,7 +668,7 @@ with col_right:
                     st.session_state.flight_start_time = time.time()
                     st.session_state.flight_status = "running"
                     add_operate_log("用户手动恢复继续飞行任务")
-                    resume_mav = mav_conn.mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION)
+                    resume_mav = mav.set_mode_encode(0, mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED, mavutil.mavlink.MAV_MODE_AUTO_MISSION)
                     add_mav_packet(resume_mav, "tx")
                     save_state()
                     st.rerun()
@@ -687,7 +678,7 @@ with col_right:
                     st.session_state.flight_start_time = None
                     st.session_state.last_wp = -1
                     add_operate_log("用户手动重置本次飞行任务")
-                    clear_mav = mav_conn.mav.mission_clear_all_encode(0, 0)
+                    clear_mav = mav.mission_clear_all_encode(0, 0)
                     add_mav_packet(clear_mav, "tx")
                     save_state()
                     st.rerun()
@@ -737,11 +728,11 @@ with col_right:
                 if current_wp > st.session_state.get("last_wp", -1) and current_wp <= total_wp:
                     st.session_state.last_wp = current_wp
                     add_rx_log(f"FCU→OBC→GCS: WP_REACHED #{current_wp}")
-                    wp_mav = mav_conn.mav.mission_item_reached_encode(current_wp)
+                    wp_mav = mav.mission_item_reached_encode(current_wp)
                     add_mav_packet(wp_mav, "rx")
                     if current_wp == total_wp:
                         add_rx_log("FCU→OBC→GCS: MISSION_COMPLETE")
-                        finish_mav = mav_conn.mav.mission_ack_encode(0, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+                        finish_mav = mav.mission_ack_encode(0, mavutil.mavlink.MAV_MISSION_ACCEPTED)
                         add_mav_packet(finish_mav, "rx")
                         add_operate_log("飞行任务全部完成，已抵达终点")
 
@@ -785,8 +776,7 @@ with col_right:
             st.session_state.seq += 1
             t = datetime.datetime.now().strftime("%H:%M:%S")
             st.session_state.heartbeat_data.append({"序号": st.session_state.seq, "时间": t, "状态": "正常"})
-            # 心跳同步生成MAV HEARTBEAT下行报文
-            hb_mav = mav_conn.mav.heartbeat_encode(
+            hb_mav = mav.heartbeat_encode(
                 mavutil.mavlink.MAV_TYPE_QUADROTOR,
                 mavutil.mavlink.MAV_AUTOPILOT_PX4,
                 0, 0, 0, 0
@@ -798,13 +788,11 @@ with col_right:
             st.dataframe(df, use_container_width=True)
 
     elif page == "通信拓扑/MAV调试":
-        # 1. 绘制三层GCS-OBC-FCU拓扑图
         draw_comm_topology()
         st.divider()
-        # 2. MAVLink报文实时窗口
         render_mavlink_view()
 
-# 原有底部自动刷新逻辑完整保留
+# 自动刷新逻辑
 if page == "飞行监控" and (st.session_state.flight_status == "running" or st.session_state.running):
     time.sleep(1)
     st.rerun()
